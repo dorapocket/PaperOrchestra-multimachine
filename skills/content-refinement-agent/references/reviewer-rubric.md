@@ -60,13 +60,33 @@ Then identify:
   - Questions: 2-4 specific questions the paper should answer for a
     reader to be convinced.
   - Decision: one of "Strong Accept", "Accept", "Borderline", "Reject",
-    "Strong Reject".
+    "Strong Reject". This is your qualitative judgment; it must be consistent
+    with the decision band the overall score falls into (see below).
   - Overall Score: weighted average 0-100. Use:
         overall = 0.20*depth + 0.20*execution + 0.15*flow
                  + 0.15*clarity + 0.20*evidence + 0.10*style
 
 Output STRICT JSON only. No prose outside the JSON.
 ```
+
+## Decision bands (canonical, derived from overall score)
+
+The free-form `decision` above is advisory. The refinement loop reasons about a
+**canonical decision band** computed deterministically from `overall_score` by
+`scripts/decision_band.py`, so the band can never drift from the number it
+summarizes:
+
+| Overall score | Decision band | Loop meaning |
+|---|---|---|
+| ≥ 80 | **Accept** | Clears the acceptance bar — loop may stop (target met) |
+| 65–79 | **Minor Revision** | Close; keep refining presentation |
+| 50–64 | **Major Revision** | Substantive gaps remain |
+| < 50 | **Reject** | Far from publishable |
+
+The reviewer's qualitative `decision` should agree with the band (e.g. don't
+write "Accept" with an overall of 62). The thresholds are configurable on
+`decision_band.py` / `score_delta.py` (`--accept-min` etc.) but default to the
+table above. See `halt-rules.md` for how the Accept band triggers an early halt.
 
 ## Output JSON schema
 
@@ -99,9 +119,16 @@ Output STRICT JSON only. No prose outside the JSON.
     "How does the temporal branch behave on videos longer than the training distribution?"
   ],
   "decision": "Borderline",
+  "decision_band": "Major Revision",
   "overall_score": 64.5
 }
 ```
+
+`decision_band` is filled in deterministically — run
+`python scripts/decision_band.py --score-json iter<N>/score.json` and copy the
+result, or let `score_delta.py` report it (it emits `decision_band_prev` /
+`decision_band_curr` on every comparison). Never hand-set it inconsistently with
+`overall_score`.
 
 ## How the loop uses this output
 

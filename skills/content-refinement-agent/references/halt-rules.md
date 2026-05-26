@@ -46,9 +46,31 @@ The script exits with:
 | 0 | ACCEPT_TIED_NON_NEGATIVE | keep new draft, continue loop |
 | 1 | REVERT_OVERALL_DECREASED | rollback to prev, halt loop |
 | 2 | REVERT_TIED_NEGATIVE_SUBAXIS | rollback to prev, halt loop |
+| 4 | HALT_PLATEAU | keep new draft (accepted), halt loop |
+| 5 | HALT_TARGET_MET | keep new draft (accepted), halt loop |
 
 The script also prints a one-line decision string and a JSON object on
 stdout for the host agent to log.
+
+## Decision bands and the target-met halt
+
+`score_delta.py` annotates every comparison with the prev/curr **decision band**
+(`decision_band.py`): Accept (≥80), Minor Revision (65–79), Major Revision
+(50–64), Reject (<50). These give the loop an *absolute* quality target on top of
+the *relative* delta rules.
+
+```
+if DECISION in {ACCEPT_IMPROVED, ACCEPT_TIED_NON_NEGATIVE}:
+    if curr.overall >= accept_threshold (default 80):
+        DECISION = HALT_TARGET_MET        # exit 5 — keep current draft, stop
+    elif consecutive_small >= plateau_streak:
+        DECISION = HALT_PLATEAU           # exit 4 — keep current draft, stop
+```
+
+Target-met takes precedence over plateau: once the paper reaches the Accept
+band there is no reason to keep iterating and risk a regression. Both 4 and 5
+**keep** the just-accepted draft (unlike REVERT, which rolls back). Disable the
+target-met halt with `--no-target-halt` (the band is still reported).
 
 ## Loop-level halt conditions
 
@@ -65,6 +87,18 @@ when ANY of these is true:
    `HALT_PLATEAU` when `N` consecutive accepted iterations each have
    `overall_delta < threshold`. Default: threshold=1.0 points, N=3.
    Configurable via `--plateau-threshold` and `--plateau-streak`.
+
+5. **Target met (exit code 5).** `score_delta.py` returns `HALT_TARGET_MET`
+   when an accepted iteration reaches the Accept band (overall ≥ 80). The
+   current draft is promoted; the loop stops rather than risk a regression.
+
+6. **DA CRITICAL standing (concession guard).** `concession_guard.py` exit 1
+   means a Devil's Advocate CRITICAL finding is still standing (unresolved and
+   not validly conceded). This **overrides an ACCEPT into a REVERT**: roll back
+   and require the next revision to address the finding before continuing. Exit
+   2 (a rejected concession with no blocked critical) is a WARN — the DA must
+   restate the attack, but it does not by itself force a revert. See
+   `da-reviewer.md`.
 
    The calling loop must pass `--consecutive-small <count>` to
    `score_delta.py` to track the streak across iterations:
