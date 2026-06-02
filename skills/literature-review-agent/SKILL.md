@@ -327,6 +327,37 @@ template **and leave everything else untouched**. Output: the full
 `template.tex` with those two sections filled. Save to
 `workspace/drafts/intro_relwork.tex`.
 
+### 5b. Append §2 to research_brief.md
+
+After `intro_relwork.tex` is drafted and before the citation coverage check,
+append §2 to `workspace/research_brief.md` (see `skills/shared/research_brief_template.md`).
+
+Template:
+
+```markdown
+## §2 · Literature Landscape
+_Written by: literature-review-agent, Step 3_
+
+**What the literature says about the core claim:** <2-3 sentence synthesis>
+
+**Strongest prior work (must address in the paper):**
+- <bibtex_key>: <why this is the strongest comparator or predecessor>
+
+**Gaps confirmed by the literature:** <list>
+
+**Baseline comparisons — verification status:**
+| Baseline | In citation_pool? | Confidence tier |
+|---|---|---|
+
+**Related Work cluster coverage:**
+| Cluster | Papers found | Notes |
+|---|---|---|
+
+**Anything the section-writing agent should know:** <important context>
+```
+
+This synthesises what was actually found — not what the outline assumed.
+
 ### 6. Verify ≥90% citation coverage
 
 ```bash
@@ -396,3 +427,4 @@ If your host has no web search tool, switch to degraded mode:
 - `scripts/crossref_client.py` — **NEW** Crossref title/DOI lookup for cross-index corroboration (no key; reads `CROSSREF_MAILTO` / `PAPER_ORCHESTRA_MAILTO`)
 - `scripts/openalex_client.py` — **NEW** OpenAlex title/DOI lookup for cross-index corroboration (no key; reads `OPENALEX_MAILTO` / `PAPER_ORCHESTRA_MAILTO`)
 - `scripts/cross_verify.py` — **NEW** cross-corroborate the S2-verified pool against Crossref + OpenAlex; flags hallucinated citations (WARN gate)
+- `skills/shared/research_brief_template.md` — **NEW** §2 schema; append after intro_relwork.tex is drafted

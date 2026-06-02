@@ -45,6 +45,28 @@ Read four input files from the workspace and produce a single JSON object at
    or Step 3 with an invalid outline — every downstream agent depends on this
    schema.
 
+8. **Append §1 to research_brief.md** (see `skills/shared/research_brief_template.md`):
+
+   After `outline.json` passes validation, append the §1 section to
+   `workspace/research_brief.md` (create the file if absent). Template:
+
+   ```markdown
+   ## §1 · Core Claim and Narrative
+   _Written by: outline-agent, Step 1_
+
+   **Core claim:** <one-sentence contribution>
+   **Narrative tension:** <gap this paper resolves>
+   **Key novelty framing:** <how the contribution is framed relative to prior work>
+   **Outline decisions:**
+   - Plotting plan: <N> figures
+   - Related Work clusters: <names>
+   - Section structure: <section titles>
+   **Potential weaknesses flagged at outline stage:**
+   - <any claim in idea.md that may be hard to support>
+   ```
+
+   This is a free-form prose append; no machine-readable schema required.
+
 ## Hard rules from the prompt (do not violate)
 
 These are excerpted from `references/prompt.md`. The validator enforces them.
@@ -111,3 +133,4 @@ paper (App. F.1, pp. 43–44).
 - `references/example-output.json` — example output from the paper
 - `references/allowed-values.md` — enumerated allowed values for each enum field
 - `scripts/validate_outline.py` — JSON Schema validator
+- `skills/shared/research_brief_template.md` — **NEW** §1 schema; append after outline.json passes validation

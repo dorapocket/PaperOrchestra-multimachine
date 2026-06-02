@@ -142,17 +142,44 @@ If your host does not support parallel sub-agents, run Sub-task B first (it has
 slower wall-clock due to Semantic Scholar QPS limits) then Sub-task A. The
 artifacts are independent, so order doesn't affect correctness.
 
+### 3.5. Outline Reconciliation (after Step 3 completes, before Step 4)
+
+Once Step 3 (Literature Review) has produced `citation_pool.json` and
+`cross_verification_report.json`, run the reconciliation step.
+
+Load `references/outline-reconciliation.md` and follow its prompt.
+Output: `workspace/outline_reconciled.json`.
+
+Validate and diff:
+
+```bash
+python skills/outline-agent/scripts/validate_outline.py workspace/outline_reconciled.json
+python skills/paper-orchestra/scripts/diff_outlines.py \
+    --original   workspace/outline.json \
+    --reconciled workspace/outline_reconciled.json \
+    --summary    workspace/reconciliation_summary.md
+```
+
+If validation fails, fall back to `outline.json` for Step 4 and warn the user.
+Show the user the `reconciliation_summary.md` (even if no changes — it confirms
+the outline matched the actual literature).
+
+**Skip conditions:** citation pool empty, Step 3 failed, or Step 2 is still
+running and the host cannot issue another call concurrently. See
+`references/outline-reconciliation.md` for full skip conditions.
+
 ### 4. Section Writing (Step 4 — ONE single multimodal LLM call)
 
 Load `skills/section-writing-agent/SKILL.md` and follow it. This is **one
 single call** in the paper (App. B: "Section Writing Agent (1 call)") — do
 *not* split it per section. The agent receives:
 
-- `outline.json`
+- `outline_reconciled.json` (use this if it exists; fall back to `outline.json`)
 - `idea.md`, `experimental_log.md`
 - `intro_relwork.tex` (already-filled from Step 3 — preserve verbatim)
 - `refs.bib` (the citation map)
 - `conference_guidelines.md`
+- `research_brief.md` (if it exists — read §1–§3 for accumulated pipeline context)
 - The actual figure image files from `workspace/figures/` (multimodal input)
 
 Output: `workspace/drafts/paper.tex` (a complete LaTeX document).
@@ -163,7 +190,15 @@ Then run the deterministic gates:
 python skills/section-writing-agent/scripts/orphan_cite_gate.py workspace/drafts/paper.tex workspace/refs.bib
 python skills/section-writing-agent/scripts/latex_sanity.py workspace/drafts/paper.tex
 python skills/paper-orchestra/scripts/anti_leakage_check.py workspace/drafts/paper.tex
+python skills/paper-orchestra/scripts/claim_evidence_gate.py \
+    --paper workspace/drafts/paper.tex \
+    --log   workspace/inputs/experimental_log.md \
+    --out   workspace/claim_evidence_report.json
 ```
+
+`claim_evidence_gate.py` is a WARN gate (exit 1 = warnings, not a hard stop).
+Report the count of unsupported claims to the user. The content-refinement agent
+will address them in Step 5.
 
 If any gate fails, the host agent must fix the issue (re-prompting the writing
 step with the gate's error report) before proceeding.
@@ -258,6 +293,10 @@ Code, Cursor, Antigravity, Cline, Aider, OpenCode).
 - `references/anti-leakage-prompt.md` — verbatim from App. D.4, prepend to every writing call
 - `references/paper-summary.md` — 1-page distillation of arXiv:2604.05018
 - `references/host-integration.md` — per-host invocation guide
+- `references/outline-reconciliation.md` — **NEW** Step 3.5 outline reconciliation protocol (AutoSci-inspired)
 - `scripts/init_workspace.py` — scaffold workspace dir tree
 - `scripts/validate_inputs.py` — verify (I, E, T, G) before running
 - `scripts/anti_leakage_check.py` — grep draft for leaked author names/emails/affils
+- `scripts/claim_evidence_gate.py` — **NEW** WARN gate: verify numeric claims in draft are grounded in experimental_log.md
+- `scripts/diff_outlines.py` — **NEW** diff original vs reconciled outline; writes reconciliation_summary.md
+- `skills/shared/research_brief_template.md` — **NEW** schema for workspace/research_brief.md (accumulated cross-agent context)
