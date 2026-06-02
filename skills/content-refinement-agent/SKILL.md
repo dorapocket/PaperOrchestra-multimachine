@@ -74,7 +74,9 @@ revert.
 
 ### 0. Pre-refinement integrity gate
 
-Before snapshotting or scoring the initial draft, run the AI failure modes gate:
+Before snapshotting or scoring the initial draft, run two gates in order:
+
+**Gate A — AI failure modes** (load `references/ai-failure-modes.md`, runs once):
 
 Load `references/ai-failure-modes.md` (which points to `skills/shared/ai_failure_modes.md`).
 Run all 7 checks against the draft and the inputs. This gate runs **once only**,
@@ -83,6 +85,30 @@ at the start of iteration 1.
 - CONFIRMED failure → write HALT entry to worklog.json, report to user, stop.
 - SUSPECTED failure → add WARNING comment to paper.tex, log in worklog.json, continue.
 - No failures → proceed.
+
+**Gate B — Claim-evidence provenance** (runs once, WARN gate):
+
+```bash
+python skills/paper-orchestra/scripts/claim_evidence_gate.py \
+    --paper workspace/drafts/paper.tex \
+    --log   workspace/inputs/experimental_log.md \
+    --out   workspace/claim_evidence_report.json
+```
+
+Exit 0 → PASS, proceed normally.
+Exit 1 → WARN: unsupported numeric claims found. Log in worklog.json as:
+`{gate: "claim_evidence", status: "WARN", unsupported_count: N, report: "workspace/claim_evidence_report.json"}`
+Pass the `unsupported` list from the report to the revision agent in Step 3 as
+an additional instruction: "The following numeric values appear in the paper but
+cannot be corroborated in experimental_log.md — verify or remove them: ..."
+Do NOT halt on Gate B warnings; the revision agent will address them.
+
+**Gate C — Read research brief** (every run, no exit code):
+
+If `workspace/research_brief.md` exists, read it before all reviewer calls.
+Pass the "Sections where evidence was thin" list from §4 as additional
+context to the Devil's Advocate reviewer. This surfaces the highest-risk
+sections for CRITICAL scrutiny.
 
 ### 0b. Snapshot the initial draft
 
@@ -109,6 +135,33 @@ For each iteration N starting from 1:
 `references/writing-quality-check.md` and run the 5-category checklist
 (Categories A–E) against the current draft. Note violations and add them to
 the revision agenda.
+
+**Update critique memory before the reviewer call** (iter N ≥ 2 only — skip for iter 1):
+
+```bash
+python skills/content-refinement-agent/scripts/update_critique_memory.py \
+    --worklog workspace/refinement/worklog.json \
+    --review  workspace/refinement/iter<N-1>/review.json \
+    --iter    <N> \
+    --out     workspace/refinement/critique_memory.json
+```
+
+This produces `critique_memory.json` with `focus_on` (persistent unresolved
+issues) and `do_not_reflag` (already-resolved issues). Inject both lists into
+the reviewer system prompt verbatim:
+
+```
+CRITIQUE MEMORY — you must honour this before reviewing:
+
+FOCUS ON (flagged in prior iterations, not yet resolved — prioritise these):
+<critique_memory.focus_on items, one per line>
+
+DO NOT RE-FLAG (already addressed in prior iterations):
+<critique_memory.do_not_reflag items, one per line>
+```
+
+This prevents the reviewer from re-discovering already-fixed issues and
+from missing genuinely stuck problems.
 
 Load `references/reviewer-rubric.md` as the system prompt for the simulated
 reviewer call. The reviewer reads `iter<N-1>/paper.pdf` (or `paper.tex` if
@@ -290,6 +343,8 @@ These rules prevent reward hacking and keep the refinement loop honest.
 - `scripts/score_trajectory.py` — per-dimension score history, regression and plateau detection
 - `scripts/apply_worklog.py` — append iteration entries to worklog.json
 - `scripts/snapshot.py` — copy paper.tex/paper.pdf into iter<N>/ for rollback
+- `scripts/update_critique_memory.py` — **NEW** build/update critique_memory.json from worklog + review (AutoSci-inspired reviewer memory)
 - `skills/shared/writing_quality_check.md` — full anti-AI-prose checklist (5 categories)
 - `skills/shared/ai_failure_modes.md` — full AI research failure modes gate (7 modes)
 - `skills/shared/handoff_schemas.md` — formal data contracts between all pipeline steps
+- `skills/shared/research_brief_template.md` — **NEW** research brief schema (read §1–§4 before first reviewer call)
