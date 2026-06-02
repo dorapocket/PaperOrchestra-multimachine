@@ -103,6 +103,33 @@ def strip_latex_commands(text: str) -> str:
     return text
 
 
+def _extract_sentence(text: str, match_start: int, match_end: int) -> str:
+    """
+    Return the sentence(s) most immediately containing the match.
+    Uses sentence boundaries (. ! ?) rather than a fixed char window for the
+    prior-work detection, so adjacent sections don't bleed in.
+    """
+    # Find the sentence start: last sentence-ending punctuation before the match
+    before = text[:match_start]
+    sent_start = max(
+        before.rfind(". "),
+        before.rfind(".\n"),
+        before.rfind("! "),
+        before.rfind("? "),
+        before.rfind("\n\n"),
+    )
+    sent_start = sent_start + 1 if sent_start >= 0 else 0
+
+    # Find the sentence end: next sentence-ending punctuation after the match
+    after = text[match_end:]
+    ends = [after.find(". "), after.find(".\n"), after.find("! "), after.find("? "),
+            after.find("\n\n")]
+    ends = [e for e in ends if e >= 0]
+    sent_end = match_end + (min(ends) + 1 if ends else len(after))
+
+    return text[sent_start:sent_end].replace("\n", " ").strip()
+
+
 def extract_claims(tex: str) -> list[Claim]:
     """Extract all quantitative claims from LaTeX source."""
     clean = strip_latex_commands(tex)
@@ -121,11 +148,17 @@ def extract_claims(tex: str) -> list[Claim]:
             except ValueError:
                 pass
 
+            # Sentence-bounded context for prior-work detection (prevents
+            # adjacent-section bleed where "Previous methods..." in Related Work
+            # falsely flags numbers in the Results section)
+            sentence = _extract_sentence(clean, m.start(), m.end())
+            is_prior = bool(PRIOR_WORK_CONTEXT.search(sentence))
+
+            # Wider context for the human-readable context snippet
             start = max(0, m.start() - CONTEXT_WINDOW)
             end = min(len(clean), m.end() + CONTEXT_WINDOW)
             ctx = clean[start:end].replace("\n", " ").strip()
 
-            is_prior = bool(PRIOR_WORK_CONTEXT.search(ctx))
             claims.append(Claim(value=val, context=ctx, pattern_id=pid, is_prior_work=is_prior))
             seen_values.add(val)
 

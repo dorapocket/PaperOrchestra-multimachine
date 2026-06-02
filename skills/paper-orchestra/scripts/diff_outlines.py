@@ -75,11 +75,17 @@ def main() -> int:
         lineterm="",
     ))
 
-    # Count changed sections
-    changed_sections = set()
+    # Count sections that contain any changed lines
+    # Track current section as we walk the diff; mark it when a +/- appears
+    changed_sections: set[str] = set()
+    current_section = "(unknown)"
     for line in diff_lines:
-        if line.startswith(("+ ##", "- ##")):
-            changed_sections.add(line[4:].strip())
+        stripped = line.rstrip("\n")
+        # Context or changed section-header lines
+        if stripped.startswith(("  ##", "+##", "-##", " ##")):
+            current_section = stripped.lstrip("+-").strip()
+        elif stripped.startswith(("+", "-")) and not stripped.startswith(("+++", "---")):
+            changed_sections.add(current_section)
 
     summary_lines = [
         "# Outline Reconciliation Summary",
