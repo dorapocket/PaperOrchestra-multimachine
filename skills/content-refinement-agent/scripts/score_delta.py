@@ -19,12 +19,25 @@ but added to match its cost budget of ~5-7 LLM calls):
     Exit code 4.  The loop should stop — further iterations are unlikely to
     yield meaningful gains.
 
+And the decision-band target halt (see decision_band.py):
+
+  - HALT_TARGET_MET if an accepted iteration reaches the "Accept" band
+    (overall >= --accept-threshold, default 80). Exit code 5. The paper now
+    clears the acceptance bar, so the loop stops on the current draft rather
+    than risk regressing it chasing marginal gains. Takes precedence over the
+    plateau halt. Disable with --no-target-halt.
+
+Every output JSON also carries the prev/curr decision band (Accept / Minor
+Revision / Major Revision / Reject) so the run report can show an absolute
+quality trajectory, not just relative deltas.
+
 Exit codes:
-    0  ACCEPT (improved or tied non-negative, and no plateau)
+    0  ACCEPT (improved or tied non-negative; below Accept band; no plateau)
     1  REVERT (overall decreased)
     2  REVERT (tied with negative sub-axis delta)
     3  argument or input error
     4  HALT_PLATEAU (accepted but diminishing returns detected)
+    5  HALT_TARGET_MET (accepted and reached the Accept band)
 
 Score JSON shape (see references/reviewer-rubric.md):
     {
@@ -47,7 +60,11 @@ Usage:
 """
 import argparse
 import json
+import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from decision_band import band_for, BAND_RANK  # noqa: E402
 
 AXES = [
     "scientific_depth",
@@ -89,6 +106,15 @@ def main() -> int:
         help="Number of consecutive small-delta accepted iterations so far "
              "(maintained by the calling loop; default: 0)",
     )
+    p.add_argument(
+        "--accept-threshold", type=float, default=80.0, metavar="SCORE",
+        help="Overall score at/above which the paper is in the Accept band; "
+             "an accepted iteration here triggers HALT_TARGET_MET (default: 80)",
+    )
+    p.add_argument(
+        "--no-target-halt", action="store_true",
+        help="Do not halt on reaching the Accept band (still reports the band)",
+    )
     args = p.parse_args()
 
     try:
@@ -126,12 +152,22 @@ def main() -> int:
         decision = "REVERT_OVERALL_DECREASED"
         exit_code = 1
 
+    # --- Decision bands (absolute quality, independent of the delta) ---
+    band_prev = band_for(p_overall, args.accept_threshold)
+    band_curr = band_for(c_overall, args.accept_threshold)
+
     # --- Plateau early-stop (only applies to accepted iterations) ---
     is_small_delta = overall_delta < args.plateau_threshold
     new_consecutive_small = (args.consecutive_small + 1) if is_small_delta else 0
     plateau_triggered = False
 
-    if exit_code == 0 and new_consecutive_small >= args.plateau_streak:
+    # --- Target-met halt takes precedence over plateau ---
+    target_met = False
+    if exit_code == 0 and not args.no_target_halt and c_overall >= args.accept_threshold:
+        decision = "HALT_TARGET_MET"
+        exit_code = 5
+        target_met = True
+    elif exit_code == 0 and new_consecutive_small >= args.plateau_streak:
         decision = "HALT_PLATEAU"
         exit_code = 4
         plateau_triggered = True
@@ -142,6 +178,11 @@ def main() -> int:
         "overall_prev":        p_overall,
         "overall_curr":        c_overall,
         "overall_delta":       overall_delta,
+        "decision_band_prev":  band_prev,
+        "decision_band_curr":  band_curr,
+        "band_improved":       BAND_RANK[band_curr] > BAND_RANK[band_prev],
+        "target_met":          target_met,
+        "accept_threshold":    args.accept_threshold,
         "subaxis_deltas":      deltas,
         "net_subaxis":         net_subaxis,
         "is_small_delta":      is_small_delta,

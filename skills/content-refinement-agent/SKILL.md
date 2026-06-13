@@ -1,6 +1,6 @@
 ---
 name: content-refinement-agent
-description: Step 5 of the PaperOrchestra pipeline (arXiv:2604.05018). Iteratively refine drafts/paper.tex by simulating peer review and applying targeted revisions, with strict accept/revert halt rules. Maintains a worklog and snapshots each iteration so revert is real, not symbolic. TRIGGER when the orchestrator delegates Step 5 or when the user asks to "refine the draft", "iterate on the paper", or "run peer review on this paper".
+description: Step 5 of the PaperOrchestra pipeline (arXiv:2604.05018). Iteratively refine drafts/paper.tex by simulating peer review and applying targeted revisions, with strict accept/revert halt rules, deterministic 0-100 decision bands (Accept/Minor/Major/Reject) that drive a target-met early stop, and a Devil's Advocate concession-threshold guard that blocks acceptance on unresolved critical findings. Maintains a worklog and snapshots each iteration so revert is real, not symbolic. TRIGGER when the orchestrator delegates Step 5 or when the user asks to "refine the draft", "iterate on the paper", or "run peer review on this paper".
 data_access_level: verified_only
 ---
 
@@ -180,6 +180,24 @@ issues a CRITICAL finding that remains unaddressed after all reviewers weigh in,
 that finding blocks the "refinement accepted" decision regardless of rubric scores.
 Log DA CRITICAL findings in worklog.json: `{da_critical: true, finding: "..."}`.
 
+Record the DA's per-round findings and concession decisions in
+`workspace/refinement/da_concessions.json` (schema in `references/da-reviewer.md`)
+and enforce the concession-threshold protocol deterministically — this stops the
+simulated DA from sycophantically caving:
+
+```bash
+python skills/content-refinement-agent/scripts/concession_guard.py \
+    --log workspace/refinement/da_concessions.json \
+    --out workspace/refinement/iter<N>/da_guard.json
+# exit 0 = clear; exit 1 = standing CRITICAL → force REVERT this iteration;
+# exit 2 = a concession was rejected (caving/consecutive) → DA must restate;
+# exit 3 = schema error.
+```
+
+The guard rejects any concession made at `rebuttal_score < 4` or in a round
+immediately following another concession, and restores the affected finding to
+"standing". A standing CRITICAL (exit 1) overrides an ACCEPT into a REVERT.
+
 Save to `workspace/refinement/iter<N>/review.json`.
 
 ### 2. Score the draft
@@ -197,6 +215,7 @@ The reviewer call produces both qualitative feedback and a per-axis score:
     "academic_style":       {"score": 68, "justification": "..."}
   },
   "overall_score": 64.5,
+  "decision_band": "Major Revision",
   "strengths": [...],
   "weaknesses": [...],
   "questions": [...]
@@ -205,6 +224,12 @@ The reviewer call produces both qualitative feedback and a per-axis score:
 
 Save to `iter<N>/score.json`. (Combined with `review.json` if your host
 emits one document; the schemas overlap.)
+
+`decision_band` is derived deterministically from `overall_score` — Accept
+(≥80) / Minor Revision (65–79) / Major Revision (50–64) / Reject (<50). Fill it
+in with `python skills/content-refinement-agent/scripts/decision_band.py
+--score-json iter<N>/score.json` rather than by hand, so it can never disagree
+with the number. The bands drive the target-met halt in Step 5.
 
 ### 3. Apply revision
 
@@ -248,6 +273,7 @@ python skills/content-refinement-agent/scripts/score_delta.py \
     --curr workspace/refinement/iter<N>/score.json \
     --plateau-threshold 1.0 \
     --plateau-streak 3 \
+    --accept-threshold 80 \
     --consecutive-small $CONSECUTIVE_SMALL \
     > workspace/refinement/iter<N>/delta.json
 
@@ -261,10 +287,11 @@ print(d['consecutive_small'])
 ```
 
 Exit codes:
-- `0` — ACCEPT (overall improved or tied with non-negative net sub-axis, no plateau)
+- `0` — ACCEPT (overall improved or tied with non-negative net sub-axis, below the Accept band, no plateau)
 - `1` — REVERT (overall decreased)
 - `2` — REVERT (tied overall, but net sub-axis change negative)
 - `4` — HALT_PLATEAU (accepted but N consecutive iterations below threshold — stop early)
+- `5` — HALT_TARGET_MET (accepted AND reached the Accept band, overall ≥ 80 — stop)
 
 Behavior:
 
@@ -274,6 +301,15 @@ Behavior:
   iterations are unlikely to yield meaningful gains. In practice ~85% of
   refinement gain comes in iteration 1; the plateau fires when subsequent
   iterations improve by less than 1 point for 3 consecutive rounds.
+- **HALT_TARGET_MET (exit 5)**: keep current (it was accepted), but stop — the
+  paper has reached the Accept band (overall ≥ 80), so there is no reason to
+  keep iterating and risk a regression. The `delta.json` carries
+  `decision_band_prev` / `decision_band_curr` for the run report.
+
+**Override — DA CRITICAL.** If `concession_guard.py` (Step 1) returned exit 1
+for this iteration, treat the outcome as **REVERT** even when `score_delta.py`
+says ACCEPT: roll back to `iter<N-1>/paper.tex` and require the next revision to
+address the standing CRITICAL finding.
 
 Always log the decision via `apply_worklog.py --decision ...`.
 
@@ -282,10 +318,13 @@ Always log the decision via `apply_worklog.py --decision ...`.
 Halt the loop when ANY of these is true:
 
 1. Iteration count reaches `ITER_CAP` (default 3).
-2. `score_delta.py` returned exit code 1 or 2 (REVERT).
+2. `score_delta.py` returned exit code 1 or 2 (REVERT), OR `concession_guard.py`
+   returned exit 1 (standing DA CRITICAL → forced REVERT).
 3. The simulated reviewer's `weaknesses` list is empty (no actionable
    feedback to apply).
 4. `score_delta.py` returned exit code 4 (HALT_PLATEAU — plateau early-stop).
+5. `score_delta.py` returned exit code 5 (HALT_TARGET_MET — reached the Accept
+   band, overall ≥ 80; promote the current draft).
 
 ### 7. Promote the best snapshot
 
@@ -300,9 +339,9 @@ cp workspace/refinement/iter<best>/paper.pdf workspace/final/paper.pdf
 
 Then in the final report, tell the user:
 - How many iterations were run
-- The final overall score
-- The score trajectory (e.g., "iter0 64.5 → iter1 67.3 (accept) → iter2 69.1 (accept) → iter3 68.9 (revert, halt)")
-- Which iteration was promoted
+- The final overall score and its decision band (Accept / Minor / Major / Reject)
+- The score trajectory with bands (e.g., "iter0 58.0 Major → iter1 67.3 Minor (accept) → iter2 81.0 Accept (halt: target met)")
+- Which iteration was promoted, and the halt reason (revert / plateau / target met / iter cap / DA critical)
 
 ## Critical safety constraints (App. F.1 page 50–51)
 
@@ -339,7 +378,9 @@ These rules prevent reward hacking and keep the refinement loop honest.
 - `references/writing-quality-check.md` — 5-category anti-AI-prose checklist (pointer to shared)
 - `references/ai-failure-modes.md` — 7-mode integrity gate run before first iteration (pointer to shared)
 - `references/da-reviewer.md` — Devil's Advocate reviewer protocol and concession rules
-- `scripts/score_delta.py` — accept/revert decision from two score JSONs
+- `scripts/score_delta.py` — accept/revert/halt decision from two score JSONs; emits decision bands + target-met halt (exit 5)
+- `scripts/decision_band.py` — map an overall score to a canonical decision band (Accept/Minor/Major/Reject)
+- `scripts/concession_guard.py` — enforce the DA concession-threshold protocol; blocks accept on a standing CRITICAL
 - `scripts/score_trajectory.py` — per-dimension score history, regression and plateau detection
 - `scripts/apply_worklog.py` — append iteration entries to worklog.json
 - `scripts/snapshot.py` — copy paper.tex/paper.pdf into iter<N>/ for rollback
