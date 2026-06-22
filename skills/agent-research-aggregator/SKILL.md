@@ -69,24 +69,41 @@ the distiller:
   statements of the session goal/method;
 - **keeps a one-line trace** of each tool call (command / file path), payload
   dropped;
-- **drops** tool results, file-write contents, edit diffs, snapshots,
+- **keeps the DELIVERABLE outputs** — a subagent's synthesized report
+  (`Agent`/`Task` result) and **workflow output** (which arrives as
+  `<task-notification>` messages) are kept **in full**, even though ordinary
+  tool results are dropped;
+- **drops** ordinary tool results, file-write contents, edit diffs, snapshots,
   tool-schema dumps, and harness state lines;
 - **redacts** API keys / tokens.
 
-Result: ~2–4% of raw size with **no methodology lost** (143 MB project →
-~3 MB, or ~250 KB if you bound it). Long sessions are split into ≤150 KB
-part-files so each stays within the extraction budget — still nothing dropped.
+Result: ~2–4% of raw size with **no methodology and no synthesized output
+lost** (143 MB project → ~3 MB, or ~250 KB if you bound it). Long sessions are
+split into ≤150 KB part-files so each stays within the extraction budget.
+
+What the bundle contains (the same curated, high-signal set the original
+aggregator targeted — not a directory dump):
+- Claude **memory** files + `CLAUDE.md`;
+- **task records** (`~/.claude/tasks/<uuid>/*.json`) — per-session task
+  subjects/descriptions, which often hold validated quantitative findings;
+- **structured** result files (`results*.json`, `metrics.json`, `eval.json`,
+  `experiments*`, `ablation*`, `*.ipynb`, `run_*/train_*` logs), found
+  recursively but with vendored/build dirs pruned;
+- distilled **transcripts**.
+Raw bench logs (hundreds of generic `*.log`) are **not** collected by default —
+pass `--include-logs` if you want them.
 
 Defaults worth knowing:
 - **Transcripts included by default** (distilled). `--no-transcripts` =
-  memory/result-only (old behaviour).
-- **Subagent (sidechain) transcripts excluded by default** — mostly redundant
-  with the main session. `--include-subagents` keeps them (10–50× more files).
+  memory/result-only.
+- **Subagent (sidechain) transcripts excluded by default** — their *final*
+  output is already in the main session as the `Agent` result. `--include-subagents`
+  keeps the full sidechain transcripts too (10–50× more files).
 - **No content truncation by default** (`--max-chars 0`). Set `--max-chars
-  60000` to bound very long sessions (head+tail kept) for far fewer extraction
-  batches at some completeness cost.
-- Leaner variants: `--no-tools` (prose only), `--no-meta` (drop recaps),
-  `--keep-results N` (re-include N chars of tool output), `--chunk-bytes`,
+  60000` to bound very long sessions (head+tail kept) for fewer extraction
+  batches.
+- `--include-logs` (raw bench logs), `--no-tasks`, `--no-tools` (prose only),
+  `--no-meta` (drop recaps), `--keep-results N`, `--chunk-bytes`,
   `--max-block-chars`. `--project <substr>` narrows to one project.
 
 Then move the bundles to one central machine by **any** transport you like

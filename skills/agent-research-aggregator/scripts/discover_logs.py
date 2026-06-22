@@ -37,10 +37,10 @@ AGENT_SPECS = {
             "projects/*/memory/**/*.md",
             "task-outputs/**/*.md",
             "task-outputs/**/*.txt",
-            "todos/**/*.json",
+            "tasks/**/*.json",     # per-session task records (was: todos/, now removed)
         ],
         "root_files": ["CLAUDE.md"],
-        "priority_dirs": ["memory"],
+        "priority_dirs": ["memory", "tasks"],
     },
     "cursor": {
         "cache_dirs": [".cursor"],

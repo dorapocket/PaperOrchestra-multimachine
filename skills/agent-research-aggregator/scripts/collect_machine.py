@@ -8,10 +8,17 @@ that machine's relevant artifacts into a small, portable, self-describing
 *bundle* that you copy to a central machine for merging (Phase 0b,
 merge_bundles.py).
 
-What goes in a bundle:
-  * memory/*.md, CLAUDE.md, todos, task-outputs        (copied verbatim)
-  * general result files (results*.json, metrics.json, *.ipynb, …)  (copied)
+What goes in a bundle (the same curated set the original aggregator targeted —
+high-signal experiment artifacts, not a directory dump):
+  * memory/*.md, CLAUDE.md                                           (copied)
+  * task records ~/.claude/tasks/<uuid>/*.json                       (copied)
+  * STRUCTURED result files (results*.json, metrics.json, eval.json,
+    experiments*, ablation*, *.ipynb, run_*/train_* logs)           (copied)
   * conversation transcripts (~/.claude/projects/*/*.jsonl)          (DISTILLED)
+
+Deliberately NOT collected by default: raw bench logs (hundreds of generic
+*.log under a results tree) — pass --include-logs if you want them. Vendored /
+build dirs (.deps, third_party, cmake-build-*, node_modules, …) are pruned.
 
 Transcripts are distilled (see distill_transcript.py) before they enter the
 bundle: raw transcripts on this machine total tens to hundreds of MB; distilled
@@ -33,8 +40,10 @@ Usage (on each machine):
 """
 
 import argparse
+import fnmatch
 import json
 import os
+import re
 import shutil
 import socket
 import sys
@@ -47,9 +56,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import discover_logs as dl          # noqa: E402
 import distill_transcript as dt     # noqa: E402
 
+# Vendored / build dirs to prune on top of discover_logs.SKIP_DIRS so the
+# recursive general-file scan doesn't drag in third-party notebooks/logs.
+_EXTRA_SKIP = {".deps", "_deps", "third_party", "cmake-build-release",
+               "cmake-build-debug", "vendor", "external", "submodules"}
+# Directories whose name implies experiment output — generic logs/configs are
+# only collected when they live under one of these (or at the search root).
+_RESULTS_DIR = re.compile(
+    r"(bench|result|eval|ablation|metric|prof|output|sweep|experiment|runs?|logs?)",
+    re.IGNORECASE)
+
 
 def _safe(s: str) -> str:
-    import re
     return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-") or "x"
 
 
@@ -64,7 +82,8 @@ def _project_for_transcript(meta: dict, jsonl: Path) -> str:
 
 
 def collect_nontranscript(roots, agents, depth, since_dt, host):
-    """Scan memory / CLAUDE.md / todos / general files via discover_logs."""
+    """Scan agent memory / CLAUDE.md files via discover_logs. (Transcripts,
+    tasks, and general result files are handled by dedicated passes below.)"""
     entries = []
     for root in roots:
         if not root.exists():
@@ -76,7 +95,6 @@ def collect_nontranscript(roots, agents, depth, since_dt, host):
             dirs += [Path(g) for g in spec["global_dirs"] if Path(g).exists()]
             for base in dirs:
                 for pattern in spec["patterns"]:
-                    # transcripts are handled separately; skip jsonl-ish here
                     prio = "HIGH" if any(p in pattern for p in spec.get("priority_dirs", [])) else "MEDIUM"
                     for e in dl.scan_dir_glob(base, pattern, agent, prio, depth, since_dt):
                         e["project"] = dl.infer_project(Path(e["path"]), root, agent)
@@ -84,9 +102,6 @@ def collect_nontranscript(roots, agents, depth, since_dt, host):
             for e in dl.scan_root_files(root, spec["root_files"], agent, since_dt):
                 e["project"] = dl.infer_project(Path(e["path"]), root, agent)
                 entries.append(e)
-        for e in dl.scan_general(root, depth, since_dt):
-            e["project"] = dl.infer_project(Path(e["path"]), root, "general")
-            entries.append(e)
     # dedup by absolute path
     seen, out = set(), []
     for e in entries:
@@ -94,11 +109,110 @@ def collect_nontranscript(roots, agents, depth, since_dt, host):
             continue
         seen.add(e["path"])
         e["machine"] = host
-        e["kind"] = "transcript" if e["path"].endswith(".jsonl") else "file"
+        e["kind"] = "file"
         out.append(e)
-    # Drop any stray .jsonl that slipped through a glob — transcripts are
-    # collected (and distilled) in the dedicated pass below.
-    return [e for e in out if not e["path"].endswith(".jsonl")]
+    # Transcripts (.jsonl) and tasks (~/.claude/tasks/) have dedicated passes.
+    return [e for e in out
+            if not e["path"].endswith(".jsonl") and "/tasks/" not in e["path"]]
+
+
+def _session_project_map():
+    """Map every session uuid -> its real working directory, read from the cwd
+    recorded inside each transcript. Lets us label task files (which are keyed
+    by session uuid) with the correct project even with --no-transcripts."""
+    m = {}
+    pd = Path.home() / ".claude" / "projects"
+    if pd.exists():
+        for jl in pd.rglob("*.jsonl"):
+            cwd = dt.session_meta(jl).get("cwd")
+            if cwd:
+                m[jl.stem] = cwd
+    return m
+
+
+def collect_tasks(host, since_dt, uuid2project):
+    """Collect ~/.claude/tasks/<session-uuid>/<n>.json — per-session task
+    records (subject + description), which frequently hold validated
+    quantitative findings. Project label comes from the session uuid -> cwd map.
+    Returns (manifest_entries, {rel_path: text})."""
+    base = Path.home() / ".claude" / "tasks"
+    entries, payload = [], {}
+    if not base.exists():
+        return entries, payload
+    for jf in sorted(base.glob("*/*.json")):
+        try:
+            st = jf.stat()
+        except OSError:
+            continue
+        if since_dt and datetime.fromtimestamp(st.st_mtime, tz=timezone.utc) < since_dt:
+            continue
+        uuid = jf.parent.name
+        project = uuid2project.get(uuid, "unknown")
+        try:
+            text = jf.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        rel = f"files/{_safe(str(project))}/tasks/{_safe(uuid)}-{_safe(jf.stem)}.json"
+        payload[rel] = text
+        entries.append({
+            "path": rel,
+            "orig_path": str(jf),
+            "agent": "claude",
+            "kind": "task",
+            "priority": "HIGH",
+            "size_bytes": len(text.encode("utf-8")),
+            "modified_iso": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
+            "truncated": False,
+            "project": project,
+            "machine": host,
+        })
+    return entries, payload
+
+
+def collect_general_recursive(roots, depth, since_dt, host, include_logs=False):
+    """Find experiment result files under each search root. Conservative by
+    design (same spirit as the original top-level scan, just not blind to depth):
+
+      * HIGH-value STRUCTURED artifacts are taken recursively (pruning vendored
+        & build dirs): results*.{json,csv,tsv}, metrics.json, eval.json,
+        experiments*.{json,yaml}, ablation*, *.ipynb, run_*/train_* logs.
+      * MEDIUM/LOW generic files (README, notes, config*, plain *.log) are taken
+        only at the search-root top level — exactly as the original did.
+
+    Raw bench logs (hundreds of *.log under a results tree) are NOT collected by
+    default; pass include_logs=True (--include-logs) to also pull generic
+    files that live under a results-like directory."""
+    skip = dl.SKIP_DIRS | _EXTRA_SKIP
+    entries = []
+    for root in roots:
+        if not root.exists():
+            continue
+        base_parts = len(root.parts)
+        for dp, dirs, files in os.walk(root):
+            if len(Path(dp).parts) - base_parts >= depth:
+                dirs[:] = []
+            dirs[:] = [d for d in dirs if d not in skip]
+            at_root = Path(dp) == root
+            in_results = include_logs and bool(_RESULTS_DIR.search(dp))
+            for fn in files:
+                for pat, prio in dl.GENERAL_PATTERNS:
+                    if not fnmatch.fnmatch(fn, pat):
+                        continue
+                    if prio == "HIGH" or at_root or in_results:
+                        e = dl.file_entry(Path(dp) / fn, "general", prio, since_dt)
+                        if e:
+                            e["project"] = str(root)
+                            e["machine"] = host
+                            e["kind"] = "file"
+                            entries.append(e)
+                    break
+    seen, out = set(), []
+    for e in entries:
+        if e["path"] in seen:
+            continue
+        seen.add(e["path"])
+        out.append(e)
+    return out
 
 
 def _is_subagent(jl: Path) -> bool:
@@ -179,6 +293,12 @@ def main():
     ap.add_argument("--host", default=None, help="Machine id (default: hostname)")
     ap.add_argument("--no-transcripts", action="store_true",
                     help="Skip conversation transcripts (collect memory/results only)")
+    ap.add_argument("--no-tasks", action="store_true",
+                    help="Skip ~/.claude/tasks/ task records")
+    ap.add_argument("--include-logs", action="store_true",
+                    help="Also collect generic logs/configs found under a "
+                         "results-like directory (can be hundreds of files; "
+                         "off by default to avoid noise)")
     ap.add_argument("--include-subagents", action="store_true",
                     help="Also distill subagent (sidechain) transcripts "
                          "(agent-*.jsonl); default keeps only main sessions")
@@ -212,15 +332,29 @@ def main():
         shutil.rmtree(out)
     (out / "files").mkdir(parents=True, exist_ok=True)
 
-    # --- non-transcript files (copied verbatim) ---
-    file_entries = collect_nontranscript(roots, agents, args.depth, since_dt, host)
-    if args.project:
-        file_entries = [e for e in file_entries
-                        if args.project.lower() in str(e.get("project", "")).lower()]
-    for e in file_entries:
+    # Keep a file if the project filter substring appears in its project label
+    # OR anywhere in its real path (so a results file physically inside the
+    # project's repo is associated with it even though it isn't under
+    # ~/.claude/projects/).
+    def _keep(e):
+        if not args.project:
+            return True
+        s = args.project.lower()
+        return (s in str(e.get("project", "")).lower()
+                or s in str(e.get("orig_path") or e.get("path", "")).lower())
+
+    # --- memory / CLAUDE.md (agent caches) + general result files (repo) ---
+    disk_entries = [e for e in collect_nontranscript(roots, agents, args.depth, since_dt, host) if _keep(e)]
+    disk_entries += [e for e in collect_general_recursive(roots, args.depth, since_dt, host, args.include_logs) if _keep(e)]
+    for e in disk_entries:
         src = Path(e["path"])
         rel = f"files/{_safe(str(e['project']))}/{e['agent']}/{_safe(src.name)}"
         dest = out / rel
+        i = 1
+        while dest.exists():               # avoid clobbering same-named files
+            rel = f"files/{_safe(str(e['project']))}/{e['agent']}/{_safe(src.stem)}-{i}{src.suffix}"
+            dest = out / rel
+            i += 1
         dest.parent.mkdir(parents=True, exist_ok=True)
         try:
             shutil.copy2(src, dest)
@@ -228,6 +362,16 @@ def main():
             continue
         e["orig_path"] = e.pop("path")
         e["path"] = rel
+
+    # --- tasks (~/.claude/tasks/<uuid>/*.json — per-session task records) ---
+    task_entries, task_payload = ([], {})
+    if not args.no_tasks:
+        task_entries, task_payload = collect_tasks(host, since_dt, _session_project_map())
+        task_entries = [e for e in task_entries if _keep(e)]
+        for e in task_entries:
+            (out / e["path"]).parent.mkdir(parents=True, exist_ok=True)
+            (out / e["path"]).write_text(task_payload[e["path"]], encoding="utf-8")
+    file_entries = disk_entries + task_entries
 
     # --- transcripts (distilled) ---
     tx_entries, tx_payload = ([], {})
@@ -266,7 +410,9 @@ def main():
         "since": args.since,
         "project_filter": args.project,
         "include_transcripts": not args.no_transcripts,
+        "include_logs": args.include_logs,
         "transcript_count": len(tx_entries),
+        "task_count": len(task_entries),
         "file_count": len(file_entries),
         "max_chars": args.max_chars,
         "schema": "po-bundle/v1",
@@ -274,9 +420,14 @@ def main():
     (out / "bundle_meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
     # --- summary ---
+    n_mem = sum(1 for e in disk_entries if e["agent"] == "claude")
+    n_gen = sum(1 for e in disk_entries if e["agent"] == "general")
     print(f"=== Bundle for host '{host}' ===")
     print(f"Output dir   : {out}")
-    print(f"Memory/result files : {len(file_entries)}")
+    print(f"Memory / CLAUDE.md  : {n_mem}")
+    print(f"Result files        : {n_gen}"
+          + ("" if args.include_logs else "   (structured only; --include-logs for raw logs)"))
+    print(f"Task records        : {len(task_entries)}")
     n_sessions = sum(1 for e in tx_entries if e.get("orig_size_bytes", 0) > 0)
     print(f"Transcripts (distilled) : {n_sessions} session(s) "
           f"→ {len(tx_entries)} file(s)")

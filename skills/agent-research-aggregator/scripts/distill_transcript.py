@@ -27,6 +27,10 @@ So this distiller is **content-first**, not budget-first:
                  heavy payload is dropped.
   KEEP (recaps)  system-written recap summaries (subtype away_summary) — these
                  state the session goal/method in a sentence. ~8 KB total.
+  KEEP (results) the DELIVERABLE results — a subagent's synthesized report
+                 (Agent/Task tool_result) and workflow output (which arrives as
+                 <task-notification> user messages) are kept in full even though
+                 ordinary tool results are dropped.
   DROP           tool_result bodies (file dumps, command output), file-write
                  contents, edit diffs, image/base64 blobs, AND the bulky
                  bookkeeping meta: file-history snapshots, tool-schema
@@ -100,6 +104,15 @@ def _redact(text: str) -> str:
     return text
 
 
+# Markers of high-signal lines that must survive bounded truncation: synthesized
+# subagent/workflow results, recap summaries, and workflow task-notifications.
+_PIN_MARKERS = (" result**:", "📋 **recap**", "<task-notification>")
+
+
+def _is_pinned(line: str) -> bool:
+    return any(mk in line for mk in _PIN_MARKERS)
+
+
 def _clip(text, limit):
     """Redact + strip. limit==0 means keep in full (no truncation)."""
     text = _redact(str(text).strip())
@@ -115,6 +128,13 @@ def _clip(text, limit):
 # For these tools the file path is the signal; the content/diff is bulk.
 _PATH_TOOLS = {"Read", "Write", "Edit", "MultiEdit", "NotebookEdit", "NotebookRead"}
 _SEARCH_TOOLS = {"Grep", "Glob"}
+
+# Tools whose tool_result IS the deliverable (a subagent's synthesized report, a
+# workflow's output). Their results are kept in full even when ordinary tool
+# results are dropped. Note: a Workflow launch returns only an ack; the real
+# workflow output arrives later as a <task-notification> user message (kept as
+# plain user text). TaskOutput fetches a finished background task's output.
+_RESULT_KEEP_TOOLS = {"Agent", "Task", "Workflow", "TaskOutput"}
 
 
 def _compact_tool_use(block: dict) -> str:
@@ -186,8 +206,14 @@ def _render_system_meta(obj, max_block):
     return []
 
 
-def _render_event(obj, *, keep_thinking, max_block, drop_tools, keep_results, keep_meta):
-    """Return zero or more distilled markdown lines for one transcript event."""
+def _render_event(obj, *, keep_thinking, max_block, drop_tools, keep_results,
+                  keep_meta, id2name):
+    """Return zero or more distilled markdown lines for one transcript event.
+
+    `id2name` maps tool_use_id -> tool name (built as we go) so a tool_result
+    can be attributed to the tool that produced it — results from *synthesis*
+    tools (subagents / workflows) ARE the deliverable and are always kept, even
+    when ordinary tool results are dropped."""
     msg = obj.get("message")
     if not isinstance(msg, dict):
         return _render_system_meta(obj, max_block) if keep_meta else []
@@ -203,19 +229,28 @@ def _render_event(obj, *, keep_thinking, max_block, drop_tools, keep_results, ke
         if isinstance(content, str):
             if _NOISE_USER.match(content):       # slash-command / stdout wrappers
                 return []
+            # NB: <task-notification> messages (workflow/background-task results)
+            # arrive here as plain user strings and are kept in full.
             txt = _clip(content, max_block)
             if txt:
                 lines.append(f"- 👤 **user**{sidechain}: {txt}")
         elif isinstance(content, list):
-            # user-role lists are tool_result blocks — mechanical, dropped
-            # unless --keep-results asked for a snippet.
-            if keep_results:
-                for b in content:
-                    if isinstance(b, dict) and b.get("type") == "tool_result":
-                        res = _clip(_text_from_result_content(b.get("content", "")),
-                                    keep_results)
-                        if res:
-                            lines.append(f"    ↳ result: {res}")
+            # user-role lists are tool_result blocks. Mechanical results (file
+            # reads, command output) are dropped unless --keep-results; but
+            # results from subagents/workflows are the synthesized output and
+            # are always kept in full.
+            for b in content:
+                if not (isinstance(b, dict) and b.get("type") == "tool_result"):
+                    continue
+                name = id2name.get(b.get("tool_use_id"), "")
+                if name in _RESULT_KEEP_TOOLS:
+                    res = _clip(_text_from_result_content(b.get("content", "")), max_block)
+                    if res:
+                        lines.append(f"    ↳ **{name} result**: {res}")
+                elif keep_results:
+                    res = _clip(_text_from_result_content(b.get("content", "")), keep_results)
+                    if res:
+                        lines.append(f"    ↳ result: {res}")
         return lines
 
     if role == "assistant" and isinstance(content, list):
@@ -231,8 +266,11 @@ def _render_event(obj, *, keep_thinking, max_block, drop_tools, keep_results, ke
                 txt = _clip(b.get("thinking", ""), max_block)
                 if txt:
                     lines.append(f"    💭 (thinking) {txt}")
-            elif t == "tool_use" and not drop_tools:  # compact skeleton only
-                lines.append(f"    ⚙ {_compact_tool_use(b)}")
+            elif t == "tool_use":
+                if b.get("id"):                   # remember for result attribution
+                    id2name[b["id"]] = b.get("name")
+                if not drop_tools:                # compact skeleton only
+                    lines.append(f"    ⚙ {_compact_tool_use(b)}")
         return lines
 
     return lines
@@ -297,6 +335,7 @@ def distill_session(path, max_chars=DEFAULT_MAX_CHARS, keep_thinking=True,
     )
 
     all_lines = []
+    id2name = {}     # tool_use_id -> tool name, for result attribution
     try:
         with path.open(encoding="utf-8", errors="replace") as fh:
             for line in fh:
@@ -307,7 +346,7 @@ def distill_session(path, max_chars=DEFAULT_MAX_CHARS, keep_thinking=True,
                 all_lines.extend(_render_event(
                     obj, keep_thinking=keep_thinking, max_block=max_block_chars,
                     drop_tools=drop_tools, keep_results=keep_results,
-                    keep_meta=keep_meta))
+                    keep_meta=keep_meta, id2name=id2name))
     except OSError as e:
         all_lines.append(f"- [error reading transcript: {e}]")
 
@@ -317,34 +356,63 @@ def distill_session(path, max_chars=DEFAULT_MAX_CHARS, keep_thinking=True,
 
     budget = max(0, max_chars - len(header))
 
-    def _len(lines):
-        return sum(len(x) + 1 for x in lines)
+    def _b(s):
+        return len(s) + 1
 
-    if _len(all_lines) <= budget:
+    if sum(_b(x) for x in all_lines) <= budget:
         return header + "\n".join(all_lines) + "\n"
 
-    # Bounded: keep a head + a tail so setup AND conclusions survive; elide the
-    # iterative middle. Whole prose blocks are kept/dropped — never cut.
-    head_budget = int(budget * 0.55)
-    head, used = [], 0
-    for ln in all_lines:
-        if used + len(ln) + 1 > head_budget:
-            break
-        head.append(ln)
-        used += len(ln) + 1
-    tail, used = [], 0
-    for ln in reversed(all_lines[len(head):]):
-        if used + len(ln) + 1 > (budget - head_budget):
-            break
-        tail.append(ln)
-        used += len(ln) + 1
-    tail.reverse()
-    elided = len(all_lines) - len(head) - len(tail)
-    body = "\n".join(head) + (
-        f"\n\n_…{elided} middle turns elided (session exceeds {max_chars} chars; "
-        f"start + end kept)…_\n\n" + "\n".join(tail)
-    )
-    return header + body + "\n"
+    # Bounded. High-signal lines are PINNED and always kept even if they sit in
+    # the elided middle: synthesized subagent/workflow results, recap summaries,
+    # and workflow <task-notification>s. The remaining budget is filled with a
+    # head + tail of the ordinary turns, and everything is emitted in original
+    # order with elision markers.
+    pinned = {i for i, ln in enumerate(all_lines) if _is_pinned(ln)}
+    keep = set()
+    pin_cost = sum(_b(all_lines[i]) for i in pinned)
+    if pin_cost <= budget:
+        keep |= pinned
+        remaining = budget - pin_cost
+        rest = [i for i in range(len(all_lines)) if i not in pinned]
+        head_budget, used = int(remaining * 0.55), 0
+        for i in rest:
+            if used + _b(all_lines[i]) > head_budget:
+                break
+            keep.add(i); used += _b(all_lines[i])
+        used2 = 0
+        for i in reversed(rest):
+            if i in keep:
+                continue
+            if used2 + _b(all_lines[i]) > remaining - used:
+                break
+            keep.add(i); used2 += _b(all_lines[i])
+    else:
+        # Pinned content alone exceeds the budget — keep pinned head+tail.
+        order = sorted(pinned)
+        used = 0
+        for i in order:
+            if used + _b(all_lines[i]) > int(budget * 0.55):
+                break
+            keep.add(i); used += _b(all_lines[i])
+        used2 = 0
+        for i in reversed(order):
+            if i in keep:
+                continue
+            if used2 + _b(all_lines[i]) > budget - used:
+                break
+            keep.add(i); used2 += _b(all_lines[i])
+
+    out, prev = [], None
+    for i, ln in enumerate(all_lines):
+        if i not in keep:
+            continue
+        if prev is not None and i > prev + 1:
+            out.append(f"\n_…{i - prev - 1} lower-signal turns elided…_\n")
+        out.append(ln)
+        prev = i
+    note = (f"\n\n_(session exceeds {max_chars} chars; synthesized results, "
+            f"recaps & workflow outputs pinned; ordinary turns head+tail-sampled)_")
+    return header + "\n".join(out) + note + "\n"
 
 
 # ---------------------------------------------------------------------------

@@ -56,14 +56,18 @@ Claude Code task outputs (from the `TaskOutput` tool) may appear as:
 These contain agent responses to long-running tasks — may include benchmark
 runs, code generation results, test outputs.
 
-### Todos — LOW VALUE (structure only)
+### Task records — HIGH VALUE
 
 ```
-.claude/todos/
-    *.json        # {id, content, status, priority}
+~/.claude/tasks/<session-uuid>/<n>.json   # {id, subject, description, status, ...}
 ```
 
-Useful for understanding what experiments were planned vs. completed.
+The current location is `tasks/` (older docs/patterns said `todos/`, which no
+longer exists). Each file is a task with a `subject` and `description` that
+frequently contain **validated quantitative findings** (e.g. *"AR steps add
+~31% wall but only ~160ms real GPU work → ~0.9s recoverable; B6000 GEMM does NOT
+degrade under concurrency"*). `collect_machine.py` collects these and labels
+each by its session uuid → project mapping. High value, small.
 
 ### Conversation transcripts — HIGHEST VALUE, but NOT collected by `discover_logs.py`
 
@@ -102,9 +106,17 @@ So distillation is **content-first**, not budget-first — Phase 0
 - **keep**: system **recap summaries** (`subtype: away_summary`) — they state
   the session goal/method in one sentence (high value, ~8 KB);
 - **keep compact**: a one-line trace per tool call (command / file path);
-- **drop**: tool_result bodies, file-write contents, edit diffs, image/base64
-  blobs, AND the bulky meta (file-history snapshots, tool-schema attachments,
-  `mode`/`permission`/`hook`/`queue`/`turn_duration`/`ai-title` markers);
+- **keep in full — synthesized outputs**: a subagent's report (`Agent`/`Task`
+  tool_result) and **workflow output**. Note how each surfaces in the jsonl:
+  - subagent result → a `tool_result` attributed (via `tool_use_id`) to an
+    `Agent`/`Task` call — kept in full (ordinary tool_results are dropped, so
+    these are recognised by tool name);
+  - workflow result → the `Workflow` tool_use only returns a launch ack; the
+    real output arrives later as a `<task-notification>` **user message**
+    (`<status>completed</status>` + `<result>{…}</result>`), kept as user text;
+- **drop**: ordinary tool_result bodies, file-write contents, edit diffs,
+  image/base64 blobs, AND the bulky meta (file-history snapshots, tool-schema
+  attachments, `mode`/`permission`/`hook`/`queue`/`turn_duration`/`ai-title`);
 - **redact**: API keys, tokens, bearer headers, AWS keys.
 
 Result ≈ 2–4% of raw size with **zero methodology lost**. Long sessions are
