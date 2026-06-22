@@ -20,6 +20,10 @@ Deliberately NOT collected by default: raw bench logs (hundreds of generic
 *.log under a results tree) — pass --include-logs if you want them. Vendored /
 build dirs (.deps, third_party, cmake-build-*, node_modules, …) are pruned.
 
+Git worktrees of one repo (different directories, one per branch) are detected
+via their shared git common-dir and grouped under one project label, with each
+worktree path / branch kept as provenance. Disable with --no-group-worktrees.
+
 Transcripts are distilled (see distill_transcript.py) before they enter the
 bundle: raw transcripts on this machine total tens to hundreds of MB; distilled
 they are ~2% of that, so a bundle stays small enough to scp and small enough to
@@ -46,6 +50,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import tarfile
 from datetime import datetime, timezone
@@ -55,6 +60,55 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import discover_logs as dl          # noqa: E402
 import distill_transcript as dt     # noqa: E402
+
+# --- git-worktree grouping -------------------------------------------------
+# The same project often has several git worktrees in different directories
+# (one per branch). Each is a distinct Claude Code cwd → distinct project. They
+# share one git common-dir, so we map every worktree's cwd to the main repo path
+# and group their history under one project label.
+_GROUP_WT = True               # toggled off by --no-group-worktrees
+_REPO_ID_CACHE: dict[str, str | None] = {}
+
+
+def _repo_identity(cwd: str) -> str | None:
+    """Canonical project label shared by all git worktrees of the repo that
+    `cwd` belongs to (the main worktree's path), or None if cwd isn't a git
+    work tree / no longer exists on disk. Cached."""
+    if cwd in _REPO_ID_CACHE:
+        return _REPO_ID_CACHE[cwd]
+    label = None
+    if os.path.isdir(cwd):
+        try:
+            r = subprocess.run(["git", "-C", cwd, "rev-parse", "--git-common-dir"],
+                               capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                common = Path(r.stdout.strip())
+                if not common.is_absolute():
+                    common = Path(cwd) / common
+                common = common.resolve()
+                label = str(common.parent) if common.name == ".git" else str(common)
+        except (OSError, subprocess.SubprocessError):
+            pass
+    _REPO_ID_CACHE[cwd] = label
+    return label
+
+
+def canon_project(label: str) -> str:
+    """Map a project label (a cwd / search-root path) to its worktree-group
+    canonical label; identity when grouping is off or it's not a git repo."""
+    if not _GROUP_WT or not label:
+        return label
+    return _repo_identity(str(label)) or label
+
+
+def _set_project(entry: dict, raw):
+    """Assign entry['project'] = canonical label, keeping the original worktree
+    path as provenance when worktree-grouping changed it."""
+    raw = str(raw)
+    c = canon_project(raw)
+    entry["project"] = c
+    if c != raw:
+        entry["project_worktree"] = raw
 
 # Vendored / build dirs to prune on top of discover_logs.SKIP_DIRS so the
 # recursive general-file scan doesn't drag in third-party notebooks/logs.
@@ -110,6 +164,7 @@ def collect_nontranscript(roots, agents, depth, since_dt, host):
         seen.add(e["path"])
         e["machine"] = host
         e["kind"] = "file"
+        _set_project(e, e["project"])
         out.append(e)
     # Transcripts (.jsonl) and tasks (~/.claude/tasks/) have dedicated passes.
     return [e for e in out
@@ -147,14 +202,15 @@ def collect_tasks(host, since_dt, uuid2project):
         if since_dt and datetime.fromtimestamp(st.st_mtime, tz=timezone.utc) < since_dt:
             continue
         uuid = jf.parent.name
-        project = uuid2project.get(uuid, "unknown")
+        raw_project = uuid2project.get(uuid, "unknown")
+        project = canon_project(raw_project)   # group git worktrees of one repo
         try:
             text = jf.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         rel = f"files/{_safe(str(project))}/tasks/{_safe(uuid)}-{_safe(jf.stem)}.json"
         payload[rel] = text
-        entries.append({
+        entry = {
             "path": rel,
             "orig_path": str(jf),
             "agent": "claude",
@@ -165,7 +221,10 @@ def collect_tasks(host, since_dt, uuid2project):
             "truncated": False,
             "project": project,
             "machine": host,
-        })
+        }
+        if project != raw_project:
+            entry["project_worktree"] = raw_project
+        entries.append(entry)
     return entries, payload
 
 
@@ -194,6 +253,9 @@ def collect_general_recursive(roots, depth, since_dt, host, include_logs=False):
             dirs[:] = [d for d in dirs if d not in skip]
             at_root = Path(dp) == root
             in_results = include_logs and bool(_RESULTS_DIR.search(dp))
+            # A result file physically inside a worktree belongs to that
+            # worktree's repo group (when grouping is on); else label by root.
+            dir_label = (_repo_identity(dp) if _GROUP_WT else None) or str(root)
             for fn in files:
                 for pat, prio in dl.GENERAL_PATTERNS:
                     if not fnmatch.fnmatch(fn, pat):
@@ -201,7 +263,7 @@ def collect_general_recursive(roots, depth, since_dt, host, include_logs=False):
                     if prio == "HIGH" or at_root or in_results:
                         e = dl.file_entry(Path(dp) / fn, "general", prio, since_dt)
                         if e:
-                            e["project"] = str(root)
+                            e["project"] = dir_label
                             e["machine"] = host
                             e["kind"] = "file"
                             entries.append(e)
@@ -251,9 +313,13 @@ def collect_transcripts(roots, since_dt, host, project_filter,
         if since_dt and datetime.fromtimestamp(st.st_mtime, tz=timezone.utc) < since_dt:
             continue
         meta = dt.session_meta(jl)
-        project = _project_for_transcript(meta, jl)
-        if project_filter and project_filter.lower() not in project.lower():
-            continue
+        raw_project = _project_for_transcript(meta, jl)
+        project = canon_project(raw_project)   # group git worktrees of one repo
+        branch = meta.get("git_branch")
+        if project_filter:
+            s = project_filter.lower()
+            if s not in project.lower() and s not in raw_project.lower():
+                continue
         md = dt.distill_session(jl, **distill_kw)
         # Keep each emitted file within the pipeline's per-file size budget by
         # splitting a long session into parts — no content is dropped.
@@ -262,7 +328,7 @@ def collect_transcripts(roots, since_dt, host, project_filter,
             suffix = "" if len(parts) == 1 else f".part{idx:02d}"
             rel = f"files/{_safe(project)}/transcripts/{_safe(jl.stem)}{suffix}.md"
             payload[rel] = part
-            entries.append({
+            entry = {
                 "path": rel,                  # bundle-relative; merge resolves it
                 "orig_path": str(jl),
                 "agent": "claude",
@@ -274,9 +340,13 @@ def collect_transcripts(roots, since_dt, host, project_filter,
                 "truncated": False,
                 "project": project,
                 "machine": host,
+                "git_branch": branch,
                 "part": f"{idx}/{len(parts)}",
                 "session_meta": meta if idx == 1 else None,
-            })
+            }
+            if project != raw_project:
+                entry["project_worktree"] = raw_project
+            entries.append(entry)
     return entries, payload
 
 
@@ -299,6 +369,9 @@ def main():
                     help="Also collect generic logs/configs found under a "
                          "results-like directory (can be hundreds of files; "
                          "off by default to avoid noise)")
+    ap.add_argument("--no-group-worktrees", action="store_true",
+                    help="Keep each git worktree as a separate project instead "
+                         "of grouping a repo's worktrees under one label")
     ap.add_argument("--include-subagents", action="store_true",
                     help="Also distill subagent (sidechain) transcripts "
                          "(agent-*.jsonl); default keeps only main sessions")
@@ -321,6 +394,8 @@ def main():
     ap.add_argument("--tar", action="store_true", help="Also produce <out>.tar.gz")
     args = ap.parse_args()
 
+    global _GROUP_WT
+    _GROUP_WT = not args.no_group_worktrees
     host = args.host or socket.gethostname()
     roots = [Path(r.strip()).expanduser().resolve() for r in args.search_roots.split(",")]
     agents = [a.strip() for a in args.agents.split(",")]
@@ -411,6 +486,7 @@ def main():
         "project_filter": args.project,
         "include_transcripts": not args.no_transcripts,
         "include_logs": args.include_logs,
+        "group_worktrees": _GROUP_WT,
         "transcript_count": len(tx_entries),
         "task_count": len(task_entries),
         "file_count": len(file_entries),
@@ -436,9 +512,23 @@ def main():
     if raw:
         print(f"  transcripts: {raw/1048576:.1f} MB raw → {dist/1024:.1f} KB distilled "
               f"({dist/raw*100:.2f}%)")
+    # surface git-worktree grouping: per project, the distinct worktrees/branches
+    wt = {}
+    for e in all_entries:
+        if e.get("project_worktree"):
+            wt.setdefault(str(e["project"]), set()).add(e["project_worktree"])
+    branches = {}
+    for e in all_entries:
+        if e.get("git_branch"):
+            branches.setdefault(str(e["project"]), set()).add(e["git_branch"])
     print("Projects in this bundle:")
     for p, n in sorted(by_project.items(), key=lambda kv: -kv[1]):
-        print(f"  {n:4d}  {p}")
+        extra = ""
+        if p in branches:
+            extra = f"   branches: {', '.join(sorted(branches[p]))}"
+        print(f"  {n:4d}  {p}{extra}")
+        for w in sorted(wt.get(p, [])):
+            print(f"          ↳ worktree: {w}")
 
     if args.tar:
         tar_path = out.with_suffix(out.suffix + ".tar.gz") if out.suffix else Path(str(out) + ".tar.gz")

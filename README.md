@@ -154,12 +154,15 @@ python skills/agent-research-aggregator/scripts/merge_bundles.py \
 ```
 
 Phase 0 emits the **same** `discovered_logs.json` (plus per-file `machine`
-provenance), so Phase 2 onward runs unchanged. It replaces Phase 1 + 1.5. Key
-flags: `--no-transcripts` (memory/results only), `--include-subagents` (keep
-redundant sidechain sessions, off by default), `--max-chars` (0 = keep all
-methodology, the default; set e.g. 60000 to bound long sessions for fewer
-extraction batches), `--no-tools` / `--keep-results N` / `--no-meta` (leaner or
-richer distillation), `--since`. See `skills/agent-research-aggregator/SKILL.md`
+provenance), so Phase 2 onward runs unchanged. It replaces Phase 1 + 1.5. It
+also collects task records (`~/.claude/tasks/`), keeps subagent/workflow output
+(synthesized `Agent` results + `<task-notification>` workflow outputs), and
+**groups a repo's git worktrees** (one per branch) under a single project. Key
+flags: `--no-transcripts` (memory/results only), `--include-subagents`,
+`--max-chars` (0 = keep all methodology, the default; set e.g. 60000 to bound
+long sessions for fewer extraction batches), `--include-logs` (raw bench logs),
+`--no-tasks`, `--no-group-worktrees`, `--no-tools` / `--keep-results N` /
+`--no-meta`, `--since`. See `skills/agent-research-aggregator/SKILL.md`
 (Phase 0) for the full protocol.
 
 ### Integration

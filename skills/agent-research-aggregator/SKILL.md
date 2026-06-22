@@ -93,6 +93,13 @@ aggregator targeted — not a directory dump):
 Raw bench logs (hundreds of generic `*.log`) are **not** collected by default —
 pass `--include-logs` if you want them.
 
+**Git worktrees are grouped.** A repo often has several worktrees in different
+directories (one per branch) — each is a distinct Claude Code cwd, so it would
+otherwise look like a separate project. They share one git common-dir, so their
+history (transcripts, memory, tasks, results) is grouped under one project
+label, with each worktree path / branch kept as provenance (`project_worktree`,
+`git_branch`). Disable with `--no-group-worktrees`.
+
 Defaults worth knowing:
 - **Transcripts included by default** (distilled). `--no-transcripts` =
   memory/result-only.
