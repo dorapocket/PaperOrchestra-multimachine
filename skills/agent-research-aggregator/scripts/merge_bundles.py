@@ -124,7 +124,7 @@ def main():
                 continue
             meta = json.loads((broot / "bundle_meta.json").read_text(encoding="utf-8")) \
                 if (broot / "bundle_meta.json").exists() else {}
-            host = meta.get("host") or broot.name
+            host = meta.get("node") or meta.get("host") or broot.name
             hosts_seen.append(host)
             manifest = json.loads((broot / "manifest.json").read_text(encoding="utf-8"))
 

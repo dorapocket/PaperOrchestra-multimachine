@@ -1,46 +1,47 @@
 #!/usr/bin/env python3
 """
-collect_machine.py — Phase 0a: per-machine collection (run on EACH machine).
+collect_machine.py — Phase 0a: per-machine / per-folder collection.
 
-When experiments are run through Claude Code on several machines, the history is
-scattered across each box's ~/.claude. This script runs ON one machine and packs
-that machine's relevant artifacts into a small, portable, self-describing
-*bundle* that you copy to a central machine for merging (Phase 0b,
-merge_bundles.py).
+Runs on ONE machine and packs that machine's Claude Code history for a project
+into a small, portable *bundle* you copy to a central machine and merge
+(merge_bundles.py).
 
-What goes in a bundle (the same curated set the original aggregator targeted —
-high-signal experiment artifacts, not a directory dump):
+You control grouping manually with two labels:
+  --project-name <LABEL>   the project this bundle belongs to. ALL files in the
+                           bundle get this label. Run collect once per folder and
+                           give the same --project-name to folders that are the
+                           same project (e.g. sibling git-worktree dirs, one per
+                           branch). At merge time, same label = one project.
+  --node <ID>              which machine this is (provenance only; does NOT affect
+                           the paper). Defaults to the hostname.
+
+Typical use — a project living in several worktree folders on one node, plus a
+copy on another node, all merged into one project "myproj":
+
+    # node gpu1 — collect each folder, same project name:
+    python collect_machine.py --search-roots ~/proj-main --project-name myproj --node gpu1 --out b1 --tar
+    python collect_machine.py --search-roots ~/proj-feat --project-name myproj --node gpu1 --out b2 --tar
+    # node gpu2:
+    python collect_machine.py --search-roots ~/proj      --project-name myproj --node gpu2 --out b3 --tar
+    # central — merge whatever tarballs you have:
+    python merge_bundles.py --bundles b1.tar.gz b2.tar.gz b3.tar.gz --project myproj --out workspace/ara/discovered_logs.json
+
+With --project-name set, collection is scoped to --search-roots: only history
+whose recorded working dir is under a search root is taken (so each per-folder
+run grabs just that folder). Without it, the bundle keeps each project's own
+path as its label and you select at merge time.
+
+What goes in a bundle (curated high-signal artifacts, not a directory dump):
   * memory/*.md, CLAUDE.md                                           (copied)
   * task records ~/.claude/tasks/<uuid>/*.json                       (copied)
   * STRUCTURED result files (results*.json, metrics.json, eval.json,
     experiments*, ablation*, *.ipynb, run_*/train_* logs)           (copied)
   * conversation transcripts (~/.claude/projects/*/*.jsonl)          (DISTILLED)
 
-Deliberately NOT collected by default: raw bench logs (hundreds of generic
-*.log under a results tree) — pass --include-logs if you want them. Vendored /
-build dirs (.deps, third_party, cmake-build-*, node_modules, …) are pruned.
-
-Git worktrees of one repo (different directories, one per branch) are detected
-via their shared git common-dir and grouped under one project label, with each
-worktree path / branch kept as provenance. Disable with --no-group-worktrees.
-
-Transcripts are distilled (see distill_transcript.py) before they enter the
-bundle: raw transcripts on this machine total tens to hundreds of MB; distilled
-they are ~2% of that, so a bundle stays small enough to scp and small enough to
-feed to the extractor without blowing context. Pass --no-transcripts to skip
-them and collect only memory/result files (the original behaviour).
-
-Every file in the bundle is tagged with this machine's host id so provenance
-survives the merge.
-
-Transport is up to you — the bundle is just a directory (or a .tar.gz). Examples:
-    scp -r po-bundle-<host>-<date>.tar.gz central:/inbox/
-    rsync -a po-bundle-<host>-<date>/ central:/inbox/po-bundle-<host>/
-
-Usage (on each machine):
-    python collect_machine.py --out ./po-bundle --tar
-    python collect_machine.py --out ./po-bundle --project vllm-mot --since 2026-01-01
-    python collect_machine.py --out ./po-bundle --no-transcripts
+NOT collected by default: raw bench logs (hundreds of generic *.log) — pass
+--include-logs. Vendored/build dirs (.deps, third_party, cmake-build-*, …) are
+pruned. Subagent sidechain transcripts are excluded (their final output is kept
+as the Agent result in the main session); --include-subagents to add them.
 """
 
 import argparse
@@ -50,7 +51,6 @@ import os
 import re
 import shutil
 import socket
-import subprocess
 import sys
 import tarfile
 from datetime import datetime, timezone
@@ -61,54 +61,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import discover_logs as dl          # noqa: E402
 import distill_transcript as dt     # noqa: E402
 
-# --- git-worktree grouping -------------------------------------------------
-# The same project often has several git worktrees in different directories
-# (one per branch). Each is a distinct Claude Code cwd → distinct project. They
-# share one git common-dir, so we map every worktree's cwd to the main repo path
-# and group their history under one project label.
-_GROUP_WT = True               # toggled off by --no-group-worktrees
-_REPO_ID_CACHE: dict[str, str | None] = {}
-
-
-def _repo_identity(cwd: str) -> str | None:
-    """Canonical project label shared by all git worktrees of the repo that
-    `cwd` belongs to (the main worktree's path), or None if cwd isn't a git
-    work tree / no longer exists on disk. Cached."""
-    if cwd in _REPO_ID_CACHE:
-        return _REPO_ID_CACHE[cwd]
-    label = None
-    if os.path.isdir(cwd):
-        try:
-            r = subprocess.run(["git", "-C", cwd, "rev-parse", "--git-common-dir"],
-                               capture_output=True, text=True, timeout=5)
-            if r.returncode == 0 and r.stdout.strip():
-                common = Path(r.stdout.strip())
-                if not common.is_absolute():
-                    common = Path(cwd) / common
-                common = common.resolve()
-                label = str(common.parent) if common.name == ".git" else str(common)
-        except (OSError, subprocess.SubprocessError):
-            pass
-    _REPO_ID_CACHE[cwd] = label
-    return label
-
-
-def canon_project(label: str) -> str:
-    """Map a project label (a cwd / search-root path) to its worktree-group
-    canonical label; identity when grouping is off or it's not a git repo."""
-    if not _GROUP_WT or not label:
-        return label
-    return _repo_identity(str(label)) or label
-
-
-def _set_project(entry: dict, raw):
-    """Assign entry['project'] = canonical label, keeping the original worktree
-    path as provenance when worktree-grouping changed it."""
-    raw = str(raw)
-    c = canon_project(raw)
-    entry["project"] = c
-    if c != raw:
-        entry["project_worktree"] = raw
+# Set from --project-name: when present, every collected file gets this label.
+_PROJECT_OVERRIDE: str | None = None
 
 # Vendored / build dirs to prune on top of discover_logs.SKIP_DIRS so the
 # recursive general-file scan doesn't drag in third-party notebooks/logs.
@@ -125,9 +79,32 @@ def _safe(s: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", s).strip("-") or "x"
 
 
+def _label(raw) -> str:
+    """The stored project label: the manual --project-name if given, else the
+    file's own project path/label."""
+    return _PROJECT_OVERRIDE or str(raw)
+
+
+def _under_roots(path, roots) -> bool:
+    """True if `path` is one of `roots` or lives under one of them."""
+    if not path:
+        return False
+    try:
+        rp = Path(path).resolve()
+    except (OSError, ValueError):
+        return False
+    for r in roots:
+        try:
+            rp.relative_to(r)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
 def _project_for_transcript(meta: dict, jsonl: Path) -> str:
-    """Canonical project label for a transcript = its recorded cwd if present,
-    else the decoded Claude project dir name."""
+    """A transcript's own project = its recorded cwd if present, else the decoded
+    Claude project dir name."""
     cwd = meta.get("cwd")
     if cwd:
         return cwd
@@ -151,10 +128,10 @@ def collect_nontranscript(roots, agents, depth, since_dt, host):
                 for pattern in spec["patterns"]:
                     prio = "HIGH" if any(p in pattern for p in spec.get("priority_dirs", [])) else "MEDIUM"
                     for e in dl.scan_dir_glob(base, pattern, agent, prio, depth, since_dt):
-                        e["project"] = dl.infer_project(Path(e["path"]), root, agent)
+                        e["project_source"] = dl.infer_project(Path(e["path"]), root, agent)
                         entries.append(e)
             for e in dl.scan_root_files(root, spec["root_files"], agent, since_dt):
-                e["project"] = dl.infer_project(Path(e["path"]), root, agent)
+                e["project_source"] = dl.infer_project(Path(e["path"]), root, agent)
                 entries.append(e)
     # dedup by absolute path
     seen, out = set(), []
@@ -164,7 +141,7 @@ def collect_nontranscript(roots, agents, depth, since_dt, host):
         seen.add(e["path"])
         e["machine"] = host
         e["kind"] = "file"
-        _set_project(e, e["project"])
+        e["project"] = _label(e["project_source"])
         out.append(e)
     # Transcripts (.jsonl) and tasks (~/.claude/tasks/) have dedicated passes.
     return [e for e in out
@@ -188,8 +165,7 @@ def _session_project_map():
 def collect_tasks(host, since_dt, uuid2project):
     """Collect ~/.claude/tasks/<session-uuid>/<n>.json — per-session task
     records (subject + description), which frequently hold validated
-    quantitative findings. Project label comes from the session uuid -> cwd map.
-    Returns (manifest_entries, {rel_path: text})."""
+    quantitative findings. Returns (manifest_entries, {rel_path: text})."""
     base = Path.home() / ".claude" / "tasks"
     entries, payload = [], {}
     if not base.exists():
@@ -202,15 +178,15 @@ def collect_tasks(host, since_dt, uuid2project):
         if since_dt and datetime.fromtimestamp(st.st_mtime, tz=timezone.utc) < since_dt:
             continue
         uuid = jf.parent.name
-        raw_project = uuid2project.get(uuid, "unknown")
-        project = canon_project(raw_project)   # group git worktrees of one repo
+        source = uuid2project.get(uuid, "unknown")
+        project = _label(source)
         try:
             text = jf.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
         rel = f"files/{_safe(str(project))}/tasks/{_safe(uuid)}-{_safe(jf.stem)}.json"
         payload[rel] = text
-        entry = {
+        entries.append({
             "path": rel,
             "orig_path": str(jf),
             "agent": "claude",
@@ -220,27 +196,22 @@ def collect_tasks(host, since_dt, uuid2project):
             "modified_iso": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
             "truncated": False,
             "project": project,
+            "project_source": source,
             "machine": host,
-        }
-        if project != raw_project:
-            entry["project_worktree"] = raw_project
-        entries.append(entry)
+        })
     return entries, payload
 
 
 def collect_general_recursive(roots, depth, since_dt, host, include_logs=False):
-    """Find experiment result files under each search root. Conservative by
-    design (same spirit as the original top-level scan, just not blind to depth):
+    """Find experiment result files under each search root. Conservative:
 
-      * HIGH-value STRUCTURED artifacts are taken recursively (pruning vendored
-        & build dirs): results*.{json,csv,tsv}, metrics.json, eval.json,
+      * HIGH-value STRUCTURED artifacts taken recursively (vendored/build dirs
+        pruned): results*.{json,csv,tsv}, metrics.json, eval.json,
         experiments*.{json,yaml}, ablation*, *.ipynb, run_*/train_* logs.
-      * MEDIUM/LOW generic files (README, notes, config*, plain *.log) are taken
-        only at the search-root top level — exactly as the original did.
+      * MEDIUM/LOW generic files (README, notes, config*, plain *.log) only at
+        the search-root top level — as the original scan did.
 
-    Raw bench logs (hundreds of *.log under a results tree) are NOT collected by
-    default; pass include_logs=True (--include-logs) to also pull generic
-    files that live under a results-like directory."""
+    Raw bench logs under a results tree are collected only with include_logs."""
     skip = dl.SKIP_DIRS | _EXTRA_SKIP
     entries = []
     for root in roots:
@@ -253,9 +224,6 @@ def collect_general_recursive(roots, depth, since_dt, host, include_logs=False):
             dirs[:] = [d for d in dirs if d not in skip]
             at_root = Path(dp) == root
             in_results = include_logs and bool(_RESULTS_DIR.search(dp))
-            # A result file physically inside a worktree belongs to that
-            # worktree's repo group (when grouping is on); else label by root.
-            dir_label = (_repo_identity(dp) if _GROUP_WT else None) or str(root)
             for fn in files:
                 for pat, prio in dl.GENERAL_PATTERNS:
                     if not fnmatch.fnmatch(fn, pat):
@@ -263,7 +231,8 @@ def collect_general_recursive(roots, depth, since_dt, host, include_logs=False):
                     if prio == "HIGH" or at_root or in_results:
                         e = dl.file_entry(Path(dp) / fn, "general", prio, since_dt)
                         if e:
-                            e["project"] = dir_label
+                            e["project_source"] = str(root)
+                            e["project"] = _label(str(root))
                             e["machine"] = host
                             e["kind"] = "file"
                             entries.append(e)
@@ -279,16 +248,17 @@ def collect_general_recursive(roots, depth, since_dt, host, include_logs=False):
 
 def _is_subagent(jl: Path) -> bool:
     """Subagent (sidechain) transcripts: filename agent-*.jsonl, or under a
-    subagents/ dir. These are usually redundant with the main session."""
+    subagents/ dir. Usually redundant with the main session."""
     return jl.name.startswith("agent-") or "subagents" in jl.parts
 
 
-def collect_transcripts(roots, since_dt, host, project_filter,
+def collect_transcripts(roots, since_dt, host, project_filter, scope_to_roots,
                         include_subagents, distill_kw, chunk_bytes):
     """Find ~/.claude/projects/*/*.jsonl (the real transcript store), distill
-    each, and return (manifest_entries, {rel_path: distilled_markdown})."""
-    # Claude Code stores transcripts in the GLOBAL projects dir regardless of
-    # which project root you ran in. Also honour any per-root .claude/projects.
+    each, and return (manifest_entries, {rel_path: distilled_markdown}).
+
+    scope_to_roots: keep only sessions whose recorded cwd is under a search root
+    (used for per-folder collection)."""
     proj_dirs = [Path.home() / ".claude" / "projects"]
     for root in roots:
         cand = root / ".claude" / "projects"
@@ -299,7 +269,6 @@ def collect_transcripts(roots, since_dt, host, project_filter,
     for pd in proj_dirs:
         if pd.exists():
             jsonls.extend(sorted(pd.rglob("*.jsonl")))
-    # unique
     jsonls = list(dict.fromkeys(jsonls))
     if not include_subagents:
         jsonls = [j for j in jsonls if not _is_subagent(j)]
@@ -313,13 +282,13 @@ def collect_transcripts(roots, since_dt, host, project_filter,
         if since_dt and datetime.fromtimestamp(st.st_mtime, tz=timezone.utc) < since_dt:
             continue
         meta = dt.session_meta(jl)
-        raw_project = _project_for_transcript(meta, jl)
-        project = canon_project(raw_project)   # group git worktrees of one repo
+        source = _project_for_transcript(meta, jl)
+        if scope_to_roots and not _under_roots(meta.get("cwd") or source, roots):
+            continue
+        if project_filter and project_filter.lower() not in str(source).lower():
+            continue
+        project = _label(source)
         branch = meta.get("git_branch")
-        if project_filter:
-            s = project_filter.lower()
-            if s not in project.lower() and s not in raw_project.lower():
-                continue
         md = dt.distill_session(jl, **distill_kw)
         # Keep each emitted file within the pipeline's per-file size budget by
         # splitting a long session into parts — no content is dropped.
@@ -328,7 +297,7 @@ def collect_transcripts(roots, since_dt, host, project_filter,
             suffix = "" if len(parts) == 1 else f".part{idx:02d}"
             rel = f"files/{_safe(project)}/transcripts/{_safe(jl.stem)}{suffix}.md"
             payload[rel] = part
-            entry = {
+            entries.append({
                 "path": rel,                  # bundle-relative; merge resolves it
                 "orig_path": str(jl),
                 "agent": "claude",
@@ -339,42 +308,44 @@ def collect_transcripts(roots, since_dt, host, project_filter,
                 "modified_iso": datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat(),
                 "truncated": False,
                 "project": project,
+                "project_source": source,
                 "machine": host,
                 "git_branch": branch,
                 "part": f"{idx}/{len(parts)}",
                 "session_meta": meta if idx == 1 else None,
-            }
-            if project != raw_project:
-                entry["project_worktree"] = raw_project
-            entries.append(entry)
+            })
     return entries, payload
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Per-machine Claude Code history collector")
+    ap = argparse.ArgumentParser(description="Per-machine/per-folder Claude Code history collector")
     ap.add_argument("--out", required=True, help="Bundle output directory")
     ap.add_argument("--search-roots", default=".",
-                    help="Comma-separated roots for memory/result files (default cwd)")
+                    help="Comma-separated folders to collect (default cwd)")
+    ap.add_argument("--project-name", default=None,
+                    help="Label ALL files in this bundle as this project. Use the "
+                         "same name across folders/worktrees/nodes that are one "
+                         "project. Implies scoping collection to --search-roots.")
+    ap.add_argument("--node", "--host", dest="node", default=None,
+                    help="Machine id (provenance only; default: hostname)")
+    ap.add_argument("--match-roots", action="store_true",
+                    help="Collect only history whose working dir is under a "
+                         "--search-root (implied by --project-name)")
     ap.add_argument("--agents", default="claude,cursor,antigravity,openclaw")
     ap.add_argument("--depth", type=int, default=4)
     ap.add_argument("--since", default=None, help="ISO 8601; only files/sessions after this")
     ap.add_argument("--project", default=None,
-                    help="Only keep projects whose label contains this substring")
-    ap.add_argument("--host", default=None, help="Machine id (default: hostname)")
+                    help="(legacy) keep only source projects whose path contains "
+                         "this substring; for explicit grouping prefer --project-name")
     ap.add_argument("--no-transcripts", action="store_true",
                     help="Skip conversation transcripts (collect memory/results only)")
     ap.add_argument("--no-tasks", action="store_true",
                     help="Skip ~/.claude/tasks/ task records")
     ap.add_argument("--include-logs", action="store_true",
-                    help="Also collect generic logs/configs found under a "
-                         "results-like directory (can be hundreds of files; "
-                         "off by default to avoid noise)")
-    ap.add_argument("--no-group-worktrees", action="store_true",
-                    help="Keep each git worktree as a separate project instead "
-                         "of grouping a repo's worktrees under one label")
+                    help="Also collect generic logs/configs under a results-like "
+                         "directory (can be hundreds of files; off by default)")
     ap.add_argument("--include-subagents", action="store_true",
-                    help="Also distill subagent (sidechain) transcripts "
-                         "(agent-*.jsonl); default keeps only main sessions")
+                    help="Also distill subagent (sidechain) transcripts")
     ap.add_argument("--no-thinking", action="store_true",
                     help="Drop assistant reasoning from distilled transcripts")
     ap.add_argument("--no-tools", action="store_true",
@@ -389,14 +360,14 @@ def main():
                     help="Cap a single content block (0 = full, default)")
     ap.add_argument("--chunk-bytes", type=int, default=150_000,
                     help="Split a long session's distilled output into <= this "
-                         "many bytes per file (keeps each within the extraction "
-                         "budget; 0 disables). Default 150000.")
+                         "many bytes per file (0 disables). Default 150000.")
     ap.add_argument("--tar", action="store_true", help="Also produce <out>.tar.gz")
     args = ap.parse_args()
 
-    global _GROUP_WT
-    _GROUP_WT = not args.no_group_worktrees
-    host = args.host or socket.gethostname()
+    global _PROJECT_OVERRIDE
+    _PROJECT_OVERRIDE = args.project_name
+    scope = bool(args.project_name) or args.match_roots
+    host = args.node or socket.gethostname()
     roots = [Path(r.strip()).expanduser().resolve() for r in args.search_roots.split(",")]
     agents = [a.strip() for a in args.agents.split(",")]
     since_dt = (datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
@@ -407,16 +378,16 @@ def main():
         shutil.rmtree(out)
     (out / "files").mkdir(parents=True, exist_ok=True)
 
-    # Keep a file if the project filter substring appears in its project label
-    # OR anywhere in its real path (so a results file physically inside the
-    # project's repo is associated with it even though it isn't under
-    # ~/.claude/projects/).
+    # Filters applied to memory/result/task entries (transcripts filter inline).
     def _keep(e):
-        if not args.project:
-            return True
-        s = args.project.lower()
-        return (s in str(e.get("project", "")).lower()
-                or s in str(e.get("orig_path") or e.get("path", "")).lower())
+        if args.project:
+            s = args.project.lower()
+            if (s not in str(e.get("project_source", "")).lower()
+                    and s not in str(e.get("orig_path") or e.get("path", "")).lower()):
+                return False
+        if scope and not _under_roots(e.get("project_source") or e.get("path"), roots):
+            return False
+        return True
 
     # --- memory / CLAUDE.md (agent caches) + general result files (repo) ---
     disk_entries = [e for e in collect_nontranscript(roots, agents, args.depth, since_dt, host) if _keep(e)]
@@ -456,7 +427,7 @@ def main():
             max_block_chars=args.max_block_chars, keep_results=args.keep_results,
             drop_tools=args.no_tools, keep_meta=not args.no_meta)
         tx_entries, tx_payload = collect_transcripts(
-            roots, since_dt, host, args.project, args.include_subagents,
+            roots, since_dt, host, args.project, scope, args.include_subagents,
             distill_kw, args.chunk_bytes)
         for rel, md in tx_payload.items():
             dest = out / rel
@@ -479,14 +450,14 @@ def main():
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 
     meta = {
-        "host": host,
+        "node": host,
+        "project_name": args.project_name,
         "search_roots": [str(r) for r in roots],
+        "scoped_to_roots": scope,
         "agents": agents,
         "since": args.since,
-        "project_filter": args.project,
         "include_transcripts": not args.no_transcripts,
         "include_logs": args.include_logs,
-        "group_worktrees": _GROUP_WT,
         "transcript_count": len(tx_entries),
         "task_count": len(task_entries),
         "file_count": len(file_entries),
@@ -498,37 +469,29 @@ def main():
     # --- summary ---
     n_mem = sum(1 for e in disk_entries if e["agent"] == "claude")
     n_gen = sum(1 for e in disk_entries if e["agent"] == "general")
-    print(f"=== Bundle for host '{host}' ===")
+    print(f"=== Bundle: project '{args.project_name or '(per-folder labels)'}' on node '{host}' ===")
     print(f"Output dir   : {out}")
     print(f"Memory / CLAUDE.md  : {n_mem}")
     print(f"Result files        : {n_gen}"
           + ("" if args.include_logs else "   (structured only; --include-logs for raw logs)"))
     print(f"Task records        : {len(task_entries)}")
     n_sessions = sum(1 for e in tx_entries if e.get("orig_size_bytes", 0) > 0)
-    print(f"Transcripts (distilled) : {n_sessions} session(s) "
-          f"→ {len(tx_entries)} file(s)")
+    print(f"Transcripts (distilled) : {n_sessions} session(s) → {len(tx_entries)} file(s)")
     raw = sum(e.get("orig_size_bytes", 0) for e in tx_entries)
     dist = sum(e["size_bytes"] for e in tx_entries)
     if raw:
         print(f"  transcripts: {raw/1048576:.1f} MB raw → {dist/1024:.1f} KB distilled "
               f"({dist/raw*100:.2f}%)")
-    # surface git-worktree grouping: per project, the distinct worktrees/branches
-    wt = {}
-    for e in all_entries:
-        if e.get("project_worktree"):
-            wt.setdefault(str(e["project"]), set()).add(e["project_worktree"])
-    branches = {}
-    for e in all_entries:
-        if e.get("git_branch"):
-            branches.setdefault(str(e["project"]), set()).add(e["git_branch"])
+    # source folders + branches that fed this bundle (provenance)
+    sources = sorted({str(e.get("project_source")) for e in all_entries if e.get("project_source")})
+    branches = sorted({e["git_branch"] for e in all_entries if e.get("git_branch")})
     print("Projects in this bundle:")
     for p, n in sorted(by_project.items(), key=lambda kv: -kv[1]):
-        extra = ""
-        if p in branches:
-            extra = f"   branches: {', '.join(sorted(branches[p]))}"
-        print(f"  {n:4d}  {p}{extra}")
-        for w in sorted(wt.get(p, [])):
-            print(f"          ↳ worktree: {w}")
+        print(f"  {n:4d}  {p}")
+    if sources:
+        print(f"Collected from folders: {', '.join(sources)}")
+    if branches:
+        print(f"Branches seen        : {', '.join(branches)}")
 
     if args.tar:
         tar_path = out.with_suffix(out.suffix + ".tar.gz") if out.suffix else Path(str(out) + ".tar.gz")

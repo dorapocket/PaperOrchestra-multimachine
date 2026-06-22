@@ -43,19 +43,36 @@ Use Phase 0 when **either** is true:
 Phase 0 has two steps. It produces the same `discovered_logs.json` that Phase 1
 would, so Phases 2–4 run unchanged afterward.
 
-### Phase 0a — collect on EACH machine (`collect_machine.py`)
+### Phase 0a — collect each folder (`collect_machine.py`)
 
-Run on every machine that has relevant history. It distills each transcript
-(`distill_transcript.py`), copies memory/result files, tags everything with the
-machine's host id, and writes a small portable **bundle**.
+Run once per folder you want to include. It distills that folder's transcripts
+(`distill_transcript.py`), copies its memory/task/result files, tags everything
+with a **node** id and a **project name** you choose, and writes a small
+portable **bundle**.
+
+You group manually with two labels:
+- `--project-name <LABEL>` — every file in the bundle gets this label. Give the
+  **same** name to folders that are the same project — e.g. sibling git-worktree
+  dirs (one per branch), or copies on different nodes. Same label at merge time
+  = one project. Setting it scopes collection to `--search-roots` (so each
+  per-folder run grabs just that folder).
+- `--node <ID>` — which machine this is. **Provenance only** — it does not
+  affect the paper.
 
 ```bash
+# a project spread across two worktree folders on gpu1, plus a copy on gpu2:
 python skills/agent-research-aggregator/scripts/collect_machine.py \
-    --out ./po-bundle \
-    --search-roots ~/my-project \
-    --since 2026-01-01 \
-    --tar              # -> po-bundle-<host>-<date>.tar.gz, small enough to scp
+    --search-roots ~/proj-main --project-name myproj --node gpu1 --out b1 --tar
+python skills/agent-research-aggregator/scripts/collect_machine.py \
+    --search-roots ~/proj-feat --project-name myproj --node gpu1 --out b2 --tar
+python skills/agent-research-aggregator/scripts/collect_machine.py \
+    --search-roots ~/proj      --project-name myproj --node gpu2 --out b3 --tar
 ```
+
+> **Are `project-name` / `node` used later?** The **project name is used** — at
+> merge you select one project, and one project = one paper, so same name =
+> grouped together. The **node is provenance only** (a `machine` tag in the
+> summary); it does not change extraction or the paper.
 
 **Distillation is content-first.** Measured on real transcripts, ~95% of the
 bytes are mechanical (tool_result file/command dumps 60%, write/edit payloads
@@ -93,12 +110,10 @@ aggregator targeted — not a directory dump):
 Raw bench logs (hundreds of generic `*.log`) are **not** collected by default —
 pass `--include-logs` if you want them.
 
-**Git worktrees are grouped.** A repo often has several worktrees in different
-directories (one per branch) — each is a distinct Claude Code cwd, so it would
-otherwise look like a separate project. They share one git common-dir, so their
-history (transcripts, memory, tasks, results) is grouped under one project
-label, with each worktree path / branch kept as provenance (`project_worktree`,
-`git_branch`). Disable with `--no-group-worktrees`.
+**Git worktrees / multiple folders for one project:** there's no auto-magic —
+just run collect on each folder with the **same `--project-name`**. They merge
+into one project. Each folder's source path and git branch are kept as
+provenance (`project_source`, `git_branch`) and printed in the summary.
 
 Defaults worth knowing:
 - **Transcripts included by default** (distilled). `--no-transcripts` =
@@ -109,30 +124,37 @@ Defaults worth knowing:
 - **No content truncation by default** (`--max-chars 0`). Set `--max-chars
   60000` to bound very long sessions (head+tail kept) for fewer extraction
   batches.
+- Without `--project-name`, the bundle keeps each project's own path as its
+  label and you select at merge; `--match-roots` scopes to `--search-roots`
+  without relabeling.
 - `--include-logs` (raw bench logs), `--no-tasks`, `--no-tools` (prose only),
   `--no-meta` (drop recaps), `--keep-results N`, `--chunk-bytes`,
-  `--max-block-chars`. `--project <substr>` narrows to one project.
+  `--max-block-chars`.
 
 Then move the bundles to one central machine by **any** transport you like
 (`scp`, `rsync`, a shared drive). The tool prints an example `scp` line.
 
 ### Phase 0b — merge on the CENTRAL machine (`merge_bundles.py`)
 
+Just pass it whatever tarballs you collected — it merges them all. If you gave
+the folders the same `--project-name`, they're already one project; pick it with
+`--project` (no `--by-basename`/`--alias` needed):
+
 ```bash
 # first pass: list merged projects (exits 2 — choose one, same as Phase 1.5)
 python skills/agent-research-aggregator/scripts/merge_bundles.py \
-    --bundles /inbox/po-bundle-gpu1.tar.gz /inbox/po-bundle-gpu2 \
-    --by-basename \
+    --bundles /inbox/b1.tar.gz /inbox/b2.tar.gz /inbox/b3.tar.gz \
     --out workspace/ara/discovered_logs.json
 
 # second pass: filter to the chosen project (exits 0)
 python skills/agent-research-aggregator/scripts/merge_bundles.py \
-    --bundles /inbox/po-bundle-* \
-    --by-basename --project vllm-mot \
+    --bundles /inbox/*.tar.gz --project myproj \
     --out workspace/ara/discovered_logs.json
 ```
 
-The **same repo usually lives at a different absolute path on each machine**, so
+`--by-basename` / `--alias` remain available for the case where you did **not**
+set `--project-name` and bundles carry raw repo paths that differ per machine.
+The **same repo then lives at a different absolute path on each machine**, so
 its transcripts carry different `cwd` labels. Reconcile them into one project:
 - `--by-basename` unifies path-like labels by their last path component
   (`/data/a/vllm-mot` + `/home/b/vllm-mot` → `vllm-mot`), and
@@ -463,14 +485,14 @@ Tell the user exactly which two files are still needed, then offer to run
 ## Quick reference
 
 ```bash
-# Phase 0 (optional: multi-machine and/or conversation transcripts)
-#   on each machine:
+# Phase 0 (optional: multi-machine/-folder and/or conversation transcripts)
+#   collect each folder; same --project-name = one project:
 python skills/agent-research-aggregator/scripts/collect_machine.py \
-    --out ./po-bundle --search-roots ~/my-project --tar
-#   ... scp the po-bundle-*.tar.gz files to one central machine ...
+    --search-roots ~/proj-main --project-name myproj --node gpu1 --out b1 --tar
+#   ... scp the b*.tar.gz files to one central machine ...
 #   on the central machine (exits 2, then re-run with --project, exits 0):
 python skills/agent-research-aggregator/scripts/merge_bundles.py \
-    --bundles /inbox/po-bundle-* --by-basename \
+    --bundles /inbox/b*.tar.gz --project myproj \
     --out workspace/ara/discovered_logs.json
 # (Phase 0 replaces Phase 1 + 1.5; jump to Phase 2 on the merged manifest.)
 

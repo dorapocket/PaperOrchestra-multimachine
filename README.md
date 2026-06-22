@@ -131,37 +131,41 @@ window if read raw.
 If your experiments ran across several machines, or you want the actual
 conversation history folded in, run **Phase 0** first:
 
+You group manually: run collect once per folder and give folders that belong to
+one project the **same `--project-name`** (worktrees of one repo, or copies on
+different nodes). Distillation is content-first — it keeps every user prompt and
+assistant methodology block in full, keeps recap summaries and synthesized
+`Agent`/workflow output, and drops the mechanical bulk (~2-4% of raw size, no
+methodology lost).
+
 ```bash
-# 1. On EACH machine — distill + bundle that machine's history. Distillation is
-#    content-first: it keeps every user prompt and assistant methodology block
-#    in full (~4% of the bytes is the real signal), keeps system recap
-#    summaries, and drops the mechanical bulk (tool results, file/diff payloads,
-#    snapshots, tool-schema dumps). ~2-4% of raw size, no methodology lost:
+# 1. Collect each folder. Same --project-name = one project; --node is just a tag.
 python skills/agent-research-aggregator/scripts/collect_machine.py \
-    --out ./po-bundle --search-roots ~/my-project --tar
+    --search-roots ~/proj-main --project-name myproj --node gpu1 --out b1 --tar
+python skills/agent-research-aggregator/scripts/collect_machine.py \
+    --search-roots ~/proj-feat --project-name myproj --node gpu1 --out b2 --tar   # a worktree
+python skills/agent-research-aggregator/scripts/collect_machine.py \
+    --search-roots ~/proj      --project-name myproj --node gpu2 --out b3 --tar   # another node
 
-# 2. Copy every po-bundle-<host>-<date>.tar.gz to one central machine
-#    (scp / rsync / shared drive — your choice).
+# 2. Copy every b*.tar.gz to one central machine (scp / rsync / shared drive).
 
-# 3. On the CENTRAL machine — merge into one manifest; --by-basename / --alias
-#    reconcile the same repo living at different paths on different machines:
+# 3. Merge whatever tarballs you have, then pick the project:
 python skills/agent-research-aggregator/scripts/merge_bundles.py \
-    --bundles /inbox/po-bundle-* --by-basename \
-    --out workspace/ara/discovered_logs.json          # exits 2: lists projects
+    --bundles /inbox/b*.tar.gz \
+    --out workspace/ara/discovered_logs.json               # exits 2: lists projects
 python skills/agent-research-aggregator/scripts/merge_bundles.py \
-    --bundles /inbox/po-bundle-* --by-basename --project my-repo \
-    --out workspace/ara/discovered_logs.json          # exits 0: ready for Phase 2
+    --bundles /inbox/b*.tar.gz --project myproj \
+    --out workspace/ara/discovered_logs.json               # exits 0: ready for Phase 2
 ```
 
 Phase 0 emits the **same** `discovered_logs.json` (plus per-file `machine`
 provenance), so Phase 2 onward runs unchanged. It replaces Phase 1 + 1.5. It
-also collects task records (`~/.claude/tasks/`), keeps subagent/workflow output
-(synthesized `Agent` results + `<task-notification>` workflow outputs), and
-**groups a repo's git worktrees** (one per branch) under a single project. Key
-flags: `--no-transcripts` (memory/results only), `--include-subagents`,
+also collects task records (`~/.claude/tasks/`) and keeps subagent/workflow
+output (synthesized `Agent` results + `<task-notification>` workflow outputs).
+Key flags: `--no-transcripts` (memory/results only), `--include-subagents`,
 `--max-chars` (0 = keep all methodology, the default; set e.g. 60000 to bound
 long sessions for fewer extraction batches), `--include-logs` (raw bench logs),
-`--no-tasks`, `--no-group-worktrees`, `--no-tools` / `--keep-results N` /
+`--no-tasks`, `--match-roots`, `--no-tools` / `--keep-results N` /
 `--no-meta`, `--since`. See `skills/agent-research-aggregator/SKILL.md`
 (Phase 0) for the full protocol.
 
