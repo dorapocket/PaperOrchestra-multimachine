@@ -120,6 +120,48 @@ The four phases are:
 | 3 Synthesis | LLM (one call) | Merges possibly-redundant experiment records into a single research narrative (`synthesis.json`). Detects multiple disconnected projects and pauses to ask the user. |
 | 4 Formatting | `format_po_inputs.py` | Converts `synthesis.json` into `idea.md` (Sparse Idea format, §3.1) and `experimental_log.md` (App. D.3), ready for `paper-orchestra`. |
 
+### Multi-machine runs + conversation transcripts (Phase 0)
+
+By default the aggregator reads only Claude Code **memory** files, `CLAUDE.md`,
+todos, and result files — from the **local** machine. It does **not** read the
+conversation transcripts (`~/.claude/projects/<encoded-path>/*.jsonl`), because
+they are huge (commonly 30–150 MB **per project**) and would blow the context
+window if read raw.
+
+If your experiments ran across several machines, or you want the actual
+conversation history folded in, run **Phase 0** first:
+
+```bash
+# 1. On EACH machine — distill + bundle that machine's history. Distillation is
+#    content-first: it keeps every user prompt and assistant methodology block
+#    in full (~4% of the bytes is the real signal), keeps system recap
+#    summaries, and drops the mechanical bulk (tool results, file/diff payloads,
+#    snapshots, tool-schema dumps). ~2-4% of raw size, no methodology lost:
+python skills/agent-research-aggregator/scripts/collect_machine.py \
+    --out ./po-bundle --search-roots ~/my-project --tar
+
+# 2. Copy every po-bundle-<host>-<date>.tar.gz to one central machine
+#    (scp / rsync / shared drive — your choice).
+
+# 3. On the CENTRAL machine — merge into one manifest; --by-basename / --alias
+#    reconcile the same repo living at different paths on different machines:
+python skills/agent-research-aggregator/scripts/merge_bundles.py \
+    --bundles /inbox/po-bundle-* --by-basename \
+    --out workspace/ara/discovered_logs.json          # exits 2: lists projects
+python skills/agent-research-aggregator/scripts/merge_bundles.py \
+    --bundles /inbox/po-bundle-* --by-basename --project my-repo \
+    --out workspace/ara/discovered_logs.json          # exits 0: ready for Phase 2
+```
+
+Phase 0 emits the **same** `discovered_logs.json` (plus per-file `machine`
+provenance), so Phase 2 onward runs unchanged. It replaces Phase 1 + 1.5. Key
+flags: `--no-transcripts` (memory/results only), `--include-subagents` (keep
+redundant sidechain sessions, off by default), `--max-chars` (0 = keep all
+methodology, the default; set e.g. 60000 to bound long sessions for fewer
+extraction batches), `--no-tools` / `--keep-results N` / `--no-meta` (leaner or
+richer distillation), `--since`. See `skills/agent-research-aggregator/SKILL.md`
+(Phase 0) for the full protocol.
+
 ### Integration
 
 **Install** — no extra dependencies beyond the base `requirements.txt`.

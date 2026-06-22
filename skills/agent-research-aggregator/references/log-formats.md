@@ -65,6 +65,63 @@ runs, code generation results, test outputs.
 
 Useful for understanding what experiments were planned vs. completed.
 
+### Conversation transcripts — HIGHEST VALUE, but NOT collected by `discover_logs.py`
+
+```
+~/.claude/projects/<encoded-cwd>/<session-uuid>.jsonl   # full session transcript
+~/.claude/projects/<encoded-cwd>/subagents/agent-*.jsonl # subagent (sidechain) sessions
+```
+
+This is the complete, ground-truth record of every experiment session: each
+line is one event (`{type, message:{role, content[...]}, cwd, gitBranch,
+timestamp, isSidechain, ...}`), with content blocks of type `text`,
+`thinking`, `tool_use`, and `tool_result`.
+
+**Why `discover_logs.py` skips them:** they are enormous and noisy — a single
+research project routinely totals 30–150 MB once tool outputs and file dumps are
+included, far past the 200 KB per-file cap, and reading them raw would blow the
+LLM context window. Note also that transcripts always live in the **global**
+`~/.claude/projects/` (keyed by the encoded working directory), **not** in a
+project-local `.claude/`.
+
+**Composition (measured, 4 real research sessions = 51 MB of content):**
+
+| part | share | value |
+|---|---|---|
+| `tool_result` (file reads, command stdout) | 60% | mechanical |
+| `tool_use` payloads (write/edit bodies, diffs) | 19% | mechanical |
+| meta: file-history snapshots + tool-schema attachments + state markers | 17% | bookkeeping |
+| **assistant text** (methodology / narration) | 2.6% | **the signal** |
+| **user text** (prompts / ideas) | 1.2% | **the signal** |
+| `thinking` | ~0% | (empty in stored transcripts) |
+
+So distillation is **content-first**, not budget-first — Phase 0
+(`collect_machine.py` / `distill_transcript.py`):
+- **keep in full** (never truncated): user prompts, assistant
+  methodology/narration text, assistant reasoning (thinking);
+- **keep**: system **recap summaries** (`subtype: away_summary`) — they state
+  the session goal/method in one sentence (high value, ~8 KB);
+- **keep compact**: a one-line trace per tool call (command / file path);
+- **drop**: tool_result bodies, file-write contents, edit diffs, image/base64
+  blobs, AND the bulky meta (file-history snapshots, tool-schema attachments,
+  `mode`/`permission`/`hook`/`queue`/`turn_duration`/`ai-title` markers);
+- **redact**: API keys, tokens, bearer headers, AWS keys.
+
+Result ≈ 2–4% of raw size with **zero methodology lost**. Long sessions are
+split into ≤150 KB part-files (no content dropped) so each fits the extraction
+budget; `--max-chars N` optionally bounds a session (head+tail kept).
+
+Standalone distiller (useful for a single session or ad-hoc inspection):
+```bash
+python skills/agent-research-aggregator/scripts/distill_transcript.py \
+    --in ~/.claude/projects/<encoded-cwd> \
+    --out-dir workspace/ara/_transcripts --max-chars 30000
+```
+
+Subagent transcripts (`agent-*.jsonl`, under `subagents/`) are usually redundant
+with the main session and are excluded by default — opt in only if a subagent
+held work the main thread never summarized.
+
 ---
 
 ## Cursor (`.cursor/`)

@@ -20,6 +20,109 @@ Before starting Phase 1, check whether aggregation is actually needed:
 
 The skill is intentionally a pre-pass — it is cheap to skip and should only run when the structured inputs don't already exist.
 
+**Was the work spread across several machines, or do you want the actual
+conversation history (not just memory files)?** Then run **Phase 0** first to
+collect + merge per-machine transcripts before Phase 1. See below.
+
+---
+
+## Phase 0 — Multi-machine collection & conversation transcripts (optional)
+
+`discover_logs.py` (Phase 1) only catalogs Claude Code **memory** files,
+`CLAUDE.md`, todos, and general result files. It deliberately does **not** read
+the conversation transcripts at `~/.claude/projects/<encoded-path>/*.jsonl` —
+those are the richest record of what an experiment did, but they are huge
+(commonly 30–150 MB **per project**) and would blow the context window if read
+raw. Phase 1 also only scans the **local** machine.
+
+Use Phase 0 when **either** is true:
+- experiments ran through Claude Code on **more than one machine**, or
+- you want the **conversation history itself** folded into extraction, not just
+  whatever happened to be written to memory.
+
+Phase 0 has two steps. It produces the same `discovered_logs.json` that Phase 1
+would, so Phases 2–4 run unchanged afterward.
+
+### Phase 0a — collect on EACH machine (`collect_machine.py`)
+
+Run on every machine that has relevant history. It distills each transcript
+(`distill_transcript.py`), copies memory/result files, tags everything with the
+machine's host id, and writes a small portable **bundle**.
+
+```bash
+python skills/agent-research-aggregator/scripts/collect_machine.py \
+    --out ./po-bundle \
+    --search-roots ~/my-project \
+    --since 2026-01-01 \
+    --tar              # -> po-bundle-<host>-<date>.tar.gz, small enough to scp
+```
+
+**Distillation is content-first.** Measured on real transcripts, ~95% of the
+bytes are mechanical (tool_result file/command dumps 60%, write/edit payloads
+19%, file-history snapshots + tool-schema attachments + state markers 17%) and
+only ~4% is the actual signal (user prompts + assistant methodology text). So
+the distiller:
+- **keeps in full** every user prompt, assistant narration/methodology block,
+  and reasoning (thinking) — **never truncated by default**, so a long method
+  write-up survives intact;
+- **keeps** system **recap summaries** (`away_summary`) — one-sentence
+  statements of the session goal/method;
+- **keeps a one-line trace** of each tool call (command / file path), payload
+  dropped;
+- **drops** tool results, file-write contents, edit diffs, snapshots,
+  tool-schema dumps, and harness state lines;
+- **redacts** API keys / tokens.
+
+Result: ~2–4% of raw size with **no methodology lost** (143 MB project →
+~3 MB, or ~250 KB if you bound it). Long sessions are split into ≤150 KB
+part-files so each stays within the extraction budget — still nothing dropped.
+
+Defaults worth knowing:
+- **Transcripts included by default** (distilled). `--no-transcripts` =
+  memory/result-only (old behaviour).
+- **Subagent (sidechain) transcripts excluded by default** — mostly redundant
+  with the main session. `--include-subagents` keeps them (10–50× more files).
+- **No content truncation by default** (`--max-chars 0`). Set `--max-chars
+  60000` to bound very long sessions (head+tail kept) for far fewer extraction
+  batches at some completeness cost.
+- Leaner variants: `--no-tools` (prose only), `--no-meta` (drop recaps),
+  `--keep-results N` (re-include N chars of tool output), `--chunk-bytes`,
+  `--max-block-chars`. `--project <substr>` narrows to one project.
+
+Then move the bundles to one central machine by **any** transport you like
+(`scp`, `rsync`, a shared drive). The tool prints an example `scp` line.
+
+### Phase 0b — merge on the CENTRAL machine (`merge_bundles.py`)
+
+```bash
+# first pass: list merged projects (exits 2 — choose one, same as Phase 1.5)
+python skills/agent-research-aggregator/scripts/merge_bundles.py \
+    --bundles /inbox/po-bundle-gpu1.tar.gz /inbox/po-bundle-gpu2 \
+    --by-basename \
+    --out workspace/ara/discovered_logs.json
+
+# second pass: filter to the chosen project (exits 0)
+python skills/agent-research-aggregator/scripts/merge_bundles.py \
+    --bundles /inbox/po-bundle-* \
+    --by-basename --project vllm-mot \
+    --out workspace/ara/discovered_logs.json
+```
+
+The **same repo usually lives at a different absolute path on each machine**, so
+its transcripts carry different `cwd` labels. Reconcile them into one project:
+- `--by-basename` unifies path-like labels by their last path component
+  (`/data/a/vllm-mot` + `/home/b/vllm-mot` → `vllm-mot`), and
+- `--alias "vllm-mot=vllm-mot,mot-router"` (repeatable) maps any label
+  containing a substring to a canonical name — also collapses sub-directory
+  sessions (`…/vllm-mot/router`) into the parent project.
+
+Merge writes the standard manifest with two extra provenance keys per file
+(`machine`, `project_original`) and a `by_machine` summary. **This replaces
+Phase 1 + Phase 1.5** — skip straight to Phase 2 on the merged manifest.
+
+> Single machine but you still want transcripts? Phase 0 works with **one**
+> bundle too: `collect_machine.py` then `merge_bundles.py --bundles ./po-bundle`.
+
 ---
 
 A pre-processing skill for PaperOrchestra (arXiv:2604.05018). Reads scattered
@@ -336,6 +439,17 @@ Tell the user exactly which two files are still needed, then offer to run
 ## Quick reference
 
 ```bash
+# Phase 0 (optional: multi-machine and/or conversation transcripts)
+#   on each machine:
+python skills/agent-research-aggregator/scripts/collect_machine.py \
+    --out ./po-bundle --search-roots ~/my-project --tar
+#   ... scp the po-bundle-*.tar.gz files to one central machine ...
+#   on the central machine (exits 2, then re-run with --project, exits 0):
+python skills/agent-research-aggregator/scripts/merge_bundles.py \
+    --bundles /inbox/po-bundle-* --by-basename \
+    --out workspace/ara/discovered_logs.json
+# (Phase 0 replaces Phase 1 + 1.5; jump to Phase 2 on the merged manifest.)
+
 # Phase 1: discover all projects (exits with code 2 — project selection required)
 python skills/agent-research-aggregator/scripts/discover_logs.py \
     --search-roots . ~ --out workspace/ara/discovered_logs.json
