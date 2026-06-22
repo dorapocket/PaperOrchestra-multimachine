@@ -230,17 +230,52 @@ def scan_general(base: Path, depth: int, since: datetime | None) -> list[dict]:
 # Main
 # ---------------------------------------------------------------------------
 
-def decode_claude_project_path(dir_name: str) -> str | None:
+def resolve_encoded_project_path(dir_name: str) -> str | None:
     """
-    Claude Code encodes project paths as directory names by replacing '/' with '-'.
-    e.g. '-home-user-projects-myproject' → '/home/user/projects/myproject'
-    Returns None if it doesn't look like an encoded path.
+    Claude Code encodes a project's working directory as a dir name by replacing
+    BOTH '/' and '-' with '-'. That is ambiguous on its own: '-data-gl325-vllm-mot'
+    could be '/data/gl325/vllm-mot' or '/data/gl325/vllm/mot'.
+
+    Resolve it against the real filesystem with a greedy longest-segment walk,
+    so a path component that itself contains hyphens (e.g. 'vllm-mot') is
+    reconstructed correctly. Returns None if no on-disk path matches (e.g. when
+    decoding on a different machine) — callers fall back to the naive decode.
     """
     if not dir_name.startswith("-"):
         return None
-    # Replace leading '-' then swap remaining '-' that correspond to path separators.
-    # The heuristic: a segment starting with '-' followed by a lowercase letter or
-    # digit is likely an encoded absolute path.
+    toks = dir_name[1:].split("-")
+    cur = Path("/")
+    parts: list[str] = []
+    i = 0
+    while i < len(toks):
+        match = None
+        # Prefer the longest run of tokens that names an existing directory.
+        for j in range(len(toks), i, -1):
+            seg = "-".join(toks[i:j])
+            if (cur / seg).exists():
+                match = (seg, j)
+                break
+        if not match:
+            return None
+        parts.append(match[0])
+        cur = cur / match[0]
+        i = match[1]
+    return str(cur) if cur != Path("/") else None
+
+
+def decode_claude_project_path(dir_name: str) -> str | None:
+    """
+    Decode a Claude Code project dir name back to its working directory.
+
+    Prefer a filesystem-grounded resolution (handles path components that
+    contain '-', like 'vllm-mot'); fall back to the naive '-'→'/' swap when the
+    path can't be found on disk (e.g. decoding logs collected on another host).
+    """
+    if not dir_name.startswith("-"):
+        return None
+    resolved = resolve_encoded_project_path(dir_name)
+    if resolved:
+        return resolved
     decoded = dir_name.replace("-", "/")
     if decoded.startswith("/") and len(decoded) > 2:
         return decoded
